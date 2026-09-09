@@ -3017,6 +3017,17 @@ static void h713_mips_init_lists(void)
 #define H713_MIPS_REC_LIST_OFF	0x4d80UL
 #define H713_MIPS_REC_ANCHOR	0x4d88UL
 
+/*
+ * SMM (shared-memory allocator) heap, mirrored from Trid_SMM_Init() in the
+ * arm64 cpu_comm driver. The heap region begins at shared+0x2ccf0 and runs to
+ * the end of shared memory; its header is page-aligned up from there. The
+ * MIPS smmMalloc() (display.bin 0x8b123040) locates a heap through the
+ * descriptor slot at shared+0x4d00 + 8*index: {phys base, size}, and returns
+ * NULL when both words read zero ("heap[%d] is not initialized!").
+ */
+#define H713_MIPS_SMM_HEAP_OFF		0x2ccf0UL
+#define H713_MIPS_SMM_SLOT_OFF		0x4d00UL
+
 static void h713_mips_init_record_pool(void)
 {
 	ulong list = H713_MIPS_SHMEM_ADDR + H713_MIPS_REC_LIST_OFF;
@@ -3047,6 +3058,53 @@ static void h713_mips_init_record_pool(void)
 		count++;
 	}
 	writew(count, list + 0x02);
+}
+
+/*
+ * Lay down the SMM heap before the coprocessor runs.
+ *
+ * The firmware's hal_adapter_init() (0x8b10ad78) calls smmMalloc() for a
+ * 44-byte signal-info buffer during app bring-up and stores the result in
+ * sgp_hal_signal_info (0x8b253628) unchecked. The SignalChange adapter
+ * (0x8b109fb0) later memcpy()s 44 bytes to that pointer BEFORE its null
+ * check, on the first HDMI source switch. With no heap, smmMalloc() returns
+ * NULL, the store to address 0 faults the MIPS, and its exception handler
+ * (misaligned store, recursion) eats DRAM until the SoC is gone.
+ *
+ * Stock and the legacy arm32 stack never saw this because mipsloader started
+ * the core from Linux, after Trid_SMM_Init() had run. Here U-Boot starts the
+ * core first, and the arm64 driver's adoption path deliberately leaves
+ * MIPS-shared state alone -- so the heap has to exist before this function
+ * returns. Values are those of Trid_SMM_Init() (cpu_comm_mem.c) and match
+ * analyse/hdmi-seq/smm_init.py; the mechanism is proven A/B in doku/74.
+ *
+ * Every pointer in the header is PHYSICAL: the MIPS reads the slot, masks to
+ * 0x1fffffff and ORs 0xa0000000 for its uncached kseg1 view. The header
+ * region is already zero from the memset in the caller.
+ */
+static void h713_mips_init_smm_heap(void)
+{
+	ulong heap = (H713_MIPS_SHMEM_ADDR + H713_MIPS_SMM_HEAP_OFF + 4095) &
+		     ~4095UL;
+	u32 size = (u32)(H713_MIPS_SHMEM_SIZE - 1 - H713_MIPS_SMM_HEAP_OFF);
+	u32 page_count = (size + 4095) >> 12;
+	u32 pt_phy = (u32)(heap + 4096);
+	u32 data_start = ((12 * page_count + 4095) & ~4095U) + 4096;
+	ulong slot = H713_MIPS_SHMEM_ADDR + H713_MIPS_SMM_SLOT_OFF;
+
+	writel(pt_phy, heap + 0x00);		/* free_list_head */
+	writel(pt_phy, heap + 0x04);		/* free_list_cur */
+	writel(page_count, heap + 0x08);
+	writel(data_start, heap + 0xb4);	/* data_start_offset */
+	writel(size, heap + 0xb8);		/* raw capacity */
+	writel((u32)heap, heap + 0xbc);		/* phys base of this header */
+
+	/* descriptor slot 0 last: this is the word that arms the heap */
+	writel(size, slot + 4);
+	writel((u32)heap, slot + 0);
+
+	printf("H713 MIPS: SMM heap prepared (base 0x%08lx, %u pages, "
+	       "slot 0x%08lx)\n", heap, page_count, slot);
 }
 
 static void h713_mips_prepare_ready_probe(void)
@@ -3100,6 +3158,7 @@ static void h713_mips_prepare_ready_probe(void)
 	h713_mips_init_share_seqs();
 	h713_mips_init_lists();
 	h713_mips_init_record_pool();
+	h713_mips_init_smm_heap();
 
 	/*
 	 * Bring the msgbox up before the coprocessor starts, not when a message
