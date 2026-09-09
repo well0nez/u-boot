@@ -1179,20 +1179,25 @@ static void h713_power_gate(void)
 	u32 flag;
 	int ret;
 
+	/*
+	 * The flag goes into every line so a console log from the field
+	 * shows what the previous life of the board left behind.
+	 */
+	flag = readl(H713_RTC_GP5_REG);
+
 	/* Override without a rebuild; anything but "0" leaves the gate on. */
 	sel = env_get("h713_gate");
 	if (sel && !strcmp(sel, "0")) {
-		printf("gate: off (h713_gate=0)\n");
+		printf("gate: off (h713_gate=0, GP5 %08x)\n", flag);
 		gate = false;
 	}
 
 	if (gate) {
-		flag = readl(H713_RTC_GP5_REG);
 		if (flag == H713_GATE_RUN1) {
-			printf("gate: warm start, booting\n");
+			printf("gate: warm start (GP5 %08x), booting\n", flag);
 			gate = false;
 		} else if (flag == H713_GATE_REQUESTED) {
-			printf("gate: power-off requested\n");
+			printf("gate: power-off requested (GP5 %08x)\n", flag);
 		} else {
 			printf("gate: cold start (GP5 %08x)\n", flag);
 		}
