@@ -162,6 +162,8 @@ static inline s64 mmc_offset(struct mmc *mmc, int copy)
 	s64 val = 0, defvalue;
 	const char *propname;
 	const char *str;
+	ofnode node;
+	u32 dtval;
 	int hwpart = 0;
 	int err;
 
@@ -199,7 +201,18 @@ static inline s64 mmc_offset(struct mmc *mmc, int copy)
 		propname = dt_prop.offset_redund;
 	}
 
-	return ofnode_conf_read_int(propname, defvalue);
+	/*
+	 * ofnode_conf_read_int() carries its default through an int. An
+	 * offset of 2 GiB or more would come back negative and be taken as
+	 * relative to the end of the device: on the HY310 (7.28 GiB eMMC)
+	 * CONFIG_ENV_OFFSET=0x93d80000 turned into 0x65d80000 that way. Read
+	 * the DT property directly and keep the Kconfig value as it is.
+	 */
+	node = ofnode_path("/config");
+	if (ofnode_valid(node) && !ofnode_read_u32(node, propname, &dtval))
+		return (int)dtval;
+
+	return defvalue;
 }
 #else
 static inline s64 mmc_offset(struct mmc *mmc, int copy)
