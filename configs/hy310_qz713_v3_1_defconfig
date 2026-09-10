@@ -63,4 +63,4 @@ CONFIG_H713_VENDOR_CHAINLOAD=y
 CONFIG_CMD_WDT=y
 CONFIG_CMD_GPIO=y
 CONFIG_ENV_SOURCE_FILE="hy310"
-CONFIG_BOOTCOMMAND="h713_disp init 0x30; run boot_${h713_boot}; run boot_net"
+CONFIG_BOOTCOMMAND="h713_disp init ${h713_project}; run boot_${h713_boot}; run boot_net"

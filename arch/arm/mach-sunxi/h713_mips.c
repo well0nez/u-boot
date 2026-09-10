@@ -10,6 +10,7 @@
 
 #include <command.h>
 #include <bmp_layout.h>
+#include <env.h>
 #include <console.h>
 #include <cpu_func.h>
 #include <fs.h>
@@ -5880,6 +5881,31 @@ static void h713_disp_dump(bool force)
  */
 #define H713_DISP_FS_IF		"mmc"
 #define H713_DISP_FS_DEV	"1:2"
+#define H713_DISP_FS_PATH	"mips"
+
+/*
+ * Where those files live is a property of the installation, not of the SoC.
+ * On a stock device they sit in the vendor FAT partition; an installation that
+ * has given that partition to something else puts them on its own filesystem
+ * and says so in the environment. fs_read() takes FS_TYPE_ANY, so ext4 works
+ * exactly like FAT, and "1#hy310-boot" addresses a partition by name.
+ *
+ *   h713_mips_dev	device[:part] or device#partname	default "1:2"
+ *   h713_mips_path	directory holding the files		default "mips"
+ */
+static const char *h713_disp_fs_dev(void)
+{
+	const char *s = env_get("h713_mips_dev");
+
+	return s && *s ? s : H713_DISP_FS_DEV;
+}
+
+static const char *h713_disp_fs_path(void)
+{
+	const char *s = env_get("h713_mips_path");
+
+	return s && *s ? s : H713_DISP_FS_PATH;
+}
 /*
  * Above the framebuffer window (which ends at 0x4d941000) and below the
  * CPU_COMM share region at 0x4e300000. Parking it inside the framebuffer
@@ -5887,14 +5913,18 @@ static void h713_disp_dump(bool force)
  */
 #define H713_DISP_LOGO_ADDR	0x4e000000UL
 
-static int h713_disp_read(const char *path, ulong addr, loff_t *len)
+static int h713_disp_read(const char *name, ulong addr, loff_t *len)
 {
+	const char *dev = h713_disp_fs_dev();
+	char path[64];
 	int ret;
 
-	ret = fs_set_blk_dev(H713_DISP_FS_IF, H713_DISP_FS_DEV, FS_TYPE_ANY);
+	snprintf(path, sizeof(path), "%s/%s", h713_disp_fs_path(), name);
+
+	ret = fs_set_blk_dev(H713_DISP_FS_IF, dev, FS_TYPE_ANY);
 	if (ret) {
 		printf("H713 disp: cannot select %s %s\n",
-		       H713_DISP_FS_IF, H713_DISP_FS_DEV);
+		       H713_DISP_FS_IF, dev);
 		return ret;
 	}
 
@@ -5933,8 +5963,8 @@ static int h713_disp_read(const char *path, ulong addr, loff_t *len)
 static int h713_disp_load_tse(u32 project)
 {
 	static const char *const fixed[] = {
-		"mips/database.TSE", "mips/pq_custom.TSE",
-		"mips/projecttable.TSE",
+		"database.TSE", "pq_custom.TSE",
+		"projecttable.TSE",
 	};
 	char pid[40];
 	ulong addr = H713_MIPS_TSE_ADDR;
@@ -5950,7 +5980,7 @@ static int h713_disp_load_tse(u32 project)
 		addr += len;
 	}
 
-	snprintf(pid, sizeof(pid), "mips/ProjectID_0x%04x.TSE", project);
+	snprintf(pid, sizeof(pid), "ProjectID_0x%04x.TSE", project);
 	ret = h713_disp_read(pid, addr, &len);
 	if (ret)
 		return ret;
@@ -5977,14 +6007,14 @@ static int h713_disp_load(u32 project)
 	uint i;
 	int ret;
 
-	printf("H713 disp: loading vendor artifacts from %s %s\n",
-	       H713_DISP_FS_IF, H713_DISP_FS_DEV);
+	printf("H713 disp: loading vendor artifacts from %s %s:%s\n",
+	       H713_DISP_FS_IF, h713_disp_fs_dev(), h713_disp_fs_path());
 
 	/* Clear first: the workspace wipe must not run over what we load. */
 	h713_mips_clear_workspace();
 	memset((void *)H713_MIPS_CFG_ADDR, 0, H713_MIPS_CFG_SIZE);
 
-	ret = h713_disp_read("mips/display.bin", H713_MIPS_FW_ADDR, &len);
+	ret = h713_disp_read("display.bin", H713_MIPS_FW_ADDR, &len);
 	if (ret)
 		return ret;
 	/*
@@ -6003,7 +6033,7 @@ static int h713_disp_load(u32 project)
 	}
 	h713_mips_fw_size = (ulong)len;
 
-	ret = h713_disp_read("mips/display_cfg.xml", H713_MIPS_CFG_ADDR, &len);
+	ret = h713_disp_read("display_cfg.xml", H713_MIPS_CFG_ADDR, &len);
 	if (ret)
 		return ret;
 	if (len > H713_MIPS_CFG_SIZE) {
@@ -6021,7 +6051,7 @@ static int h713_disp_load(u32 project)
 		return ret;
 	printf("H713 disp: config/TSE windows published for MIPS\n");
 
-	ret = h713_disp_read("mips/LogoRegData.bin", H713_DISP_LOGO_ADDR, &len);
+	ret = h713_disp_read("LogoRegData.bin", H713_DISP_LOGO_ADDR, &len);
 	if (ret)
 		return ret;
 
