@@ -924,11 +924,9 @@ int misc_init_r(void)
 			{ "fastboot_raw_partition_uboot",
 			  "0x10 0x40",       "0x10 0x1ff0" },
 			{ "fastboot_raw_partition_ubootp",
-			  "0x49ac00 0x2000", "0x12000 0x2000" },
-			{ "fastboot_raw_partition_vboot0",
-			  "0x100 0x40",      NULL },
+			  "0x800 0x2800",    "0x49ac00 0x2000" },
 			{ "fastboot_raw_partition_splstash",
-			  "0x49cc00 0x40",   "0x14000 0x40" },
+			  "0x3880 0x40",     "0x49cc00 0x40" },
 		};
 		int i;
 
@@ -938,10 +936,13 @@ int misc_init_r(void)
 			/* Retire defaults that are now actively wrong: the
 			 * 0x1ff0-sector first-stage guard is wide enough to
 			 * flash the whole concatenated image over the vendor's
-			 * boot region, and the 0x12000 targets point into
-			 * bootloader_a, which is the vendor's display-artifact
-			 * filesystem and not ours to write.  A value someone
-			 * actually chose is left alone.
+			 * boot region, and the old 0x49ac00/0x49cc00 targets
+			 * sit 2.3 GiB into the device, which under the current
+			 * layout is the middle of the root filesystem.  A value
+			 * someone actually chose is left alone.
+			 *
+			 * vboot0 went with the vendor boot0 copy at LBA 256:
+			 * there is no second vendor chain left to flash.
 			 */
 			if (!cur ||
 			    (raw_parts[i].old && !strcmp(cur, raw_parts[i].old)))

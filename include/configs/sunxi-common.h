@@ -380,9 +380,8 @@
 #define H713_FASTBOOT_ENV_SETTINGS \
 	"fastboot_raw_partition_bootloader=0x10 0x40\0" \
 	"fastboot_raw_partition_uboot=0x10 0x40\0" \
-	"fastboot_raw_partition_ubootp=0x49ac00 0x2000\0" \
-	"fastboot_raw_partition_vboot0=0x100 0x40\0" \
-	"fastboot_raw_partition_splstash=0x49cc00 0x40\0" \
+	"fastboot_raw_partition_ubootp=0x800 0x2800\0" \
+	"fastboot_raw_partition_splstash=0x3880 0x40\0" \
 	H713_SWITCH_ENV_SETTINGS \
 	H713_FASTBOOT_MODE_ENV_SETTINGS
 #else
