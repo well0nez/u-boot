@@ -209,6 +209,15 @@ enum env_location env_get_location(enum env_operation op, int prio)
 			return ENVL_FAT;
 		if (IS_ENABLED(CONFIG_ENV_IS_IN_UBI))
 			return ENVL_UBI;
+		/*
+		 * Booting over FEL lands here: the SoC came up over USB, so
+		 * there is no boot medium to derive a location from, and a
+		 * defconfig keeping its environment solely in MMC matches
+		 * none of the cases above. The on-board MMC is still present
+		 * either way, so use it rather than hanging.
+		 */
+		if (IS_ENABLED(CONFIG_ENV_IS_IN_MMC))
+			return ENVL_MMC;
 	}
 
 	return ENVL_UNKNOWN;
