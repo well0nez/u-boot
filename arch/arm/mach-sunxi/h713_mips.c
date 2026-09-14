@@ -10,6 +10,7 @@
 
 #include <command.h>
 #include <blk.h>
+#include <part.h>
 #include <sunxi_image.h>
 #include <bmp_layout.h>
 #include <env.h>
@@ -6012,6 +6013,119 @@ static void h713_disp_dump(bool force)
 #define H713_DISP_FS_IF		"mmc"
 #define H713_DISP_FS_DEV	"1:2"
 #define H713_DISP_FS_PATH	"mips"
+#define H713_DISP_MMC_DEV	1
+
+/*
+ * The A/B slot, as the vendor U-Boot reads it.
+ *
+ * Its part_get_partno() (stock 0x4a004514) does not take the name it is given:
+ * slotify_name() (0x4a004454) first checks the name against the env list
+ * ab_partition_list -- which ships as "bootloader,env,boot,vendor_boot,dtbo,
+ * vbmeta,..." -- and, for a name in that list, appends the active slot before
+ * the GPT is ever walked. The slot comes from the misc partition, where Android
+ * keeps its bootloader_control block at offset 2048: four bytes of slot suffix
+ * ("_a"/"_b"), then the magic 0x42414342. There is no cross-slot fallback: if
+ * misc says _b, stock reads bootloader_b and nothing else (A0 report, 1a).
+ *
+ * A device with no misc partition, or a misc without a valid control block, is
+ * not an A/B device in any way we can read, so "_a" is the answer -- that is
+ * also what env.fex ships as slot_suffix.
+ */
+#define H713_DISP_BOOT_CTRL_OFF		2048
+#define H713_DISP_BOOT_CTRL_MAGIC	0x42414342
+
+static struct blk_desc *h713_disp_blk(void)
+{
+	return blk_get_devnum_by_uclass_id(UCLASS_MMC, H713_DISP_MMC_DEV);
+}
+
+static const char *h713_disp_slot_suffix(void)
+{
+	static u8 sector[512] __aligned(ARCH_DMA_MINALIGN);
+	struct blk_desc *desc = h713_disp_blk();
+	struct disk_partition info;
+
+	if (!desc || part_get_info_by_name(desc, "misc", &info) < 0)
+		return "_a";
+	if (!info.blksz || info.blksz > sizeof(sector))
+		return "_a";
+	if (blk_dread(desc, info.start + H713_DISP_BOOT_CTRL_OFF / info.blksz,
+		      1, sector) != 1)
+		return "_a";
+	if (get_unaligned_le32(sector + 4) != H713_DISP_BOOT_CTRL_MAGIC)
+		return "_a";
+
+	return (sector[0] == '_' && sector[1] == 'b') ? "_b" : "_a";
+}
+
+/*
+ * Which partition holds the display artifacts is a property of the layout, and
+ * we now know three of them. "mmc 1:2" was this board's bootloader_b by index,
+ * and an index is exactly what a second layout does not share: on the HY300 T08
+ * and the HY350 the same number is a different partition, and on a device this
+ * port was installed on there is no vendor FAT at all (doku/109).
+ *
+ * So ask for the partition by name, the way stock does, and let the GPT say
+ * where it is:
+ *
+ *   bootloader_a / bootloader_b  stock, per the slot in misc
+ *   bootloader                   a layout without A/B
+ *   hy310-boot                   ours
+ *
+ * Stock first, because a device that still has both is a stock device that has
+ * been installed onto -- and then the vendor artifacts in the vendor partition
+ * are the ones stock itself would read. The environment overrides all of it
+ * (h713_mips_dev), and our own boot script sets it, so on an installed HY310
+ * none of this runs.
+ *
+ * The result is cached: part_get_info_by_name() walks the GPT entry by entry,
+ * and a load does five reads. An mmc rescan onto a differently partitioned card
+ * therefore keeps the first answer; set h713_mips_dev if that ever matters.
+ */
+static const struct {
+	const char *name;
+	bool slotted;
+} h713_disp_parts[] = {
+	{ "bootloader", true },
+	{ "hy310-boot", false },
+};
+
+static const char *h713_disp_resolve_dev(void)
+{
+	static char resolved[24];
+	struct blk_desc *desc;
+	struct disk_partition info;
+	char name[PART_NAME_LEN];
+	uint i;
+
+	if (resolved[0])
+		return resolved;
+
+	desc = h713_disp_blk();
+	if (!desc)
+		return H713_DISP_FS_DEV;
+
+	for (i = 0; i < ARRAY_SIZE(h713_disp_parts); i++) {
+		if (h713_disp_parts[i].slotted) {
+			snprintf(name, sizeof(name), "%s%s",
+				 h713_disp_parts[i].name,
+				 h713_disp_slot_suffix());
+			if (part_get_info_by_name(desc, name, &info) >= 0)
+				goto found;
+		}
+		strlcpy(name, h713_disp_parts[i].name, sizeof(name));
+		if (part_get_info_by_name(desc, name, &info) >= 0)
+			goto found;
+	}
+
+	return H713_DISP_FS_DEV;
+
+found:
+	snprintf(resolved, sizeof(resolved), "%d#%s", H713_DISP_MMC_DEV, name);
+	printf("H713 disp: artifacts partition %s, by name\n", name);
+
+	return resolved;
+}
 
 /*
  * Where those files live is a property of the installation, not of the SoC.
@@ -6020,14 +6134,14 @@ static void h713_disp_dump(bool force)
  * and says so in the environment. fs_read() takes FS_TYPE_ANY, so ext4 works
  * exactly like FAT, and "1#hy310-boot" addresses a partition by name.
  *
- *   h713_mips_dev	device[:part] or device#partname	default "1:2"
+ *   h713_mips_dev	device[:part] or device#partname	default: by name
  *   h713_mips_path	directory holding the files		default "mips"
  */
 static const char *h713_disp_fs_dev(void)
 {
 	const char *s = env_get("h713_mips_dev");
 
-	return s && *s ? s : H713_DISP_FS_DEV;
+	return s && *s ? s : h713_disp_resolve_dev();
 }
 
 static const char *h713_disp_fs_path(void)
