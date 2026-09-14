@@ -11680,10 +11680,16 @@ static void h713_probe_report(void)
 	if (h713_mips_verify())
 		return;
 
+	/*
+	 * Only located, never patched: the probe does not start the
+	 * firmware, so there is no wait to defuse. "Not patched" read like
+	 * a fault to the first person who saw it -- say what it is for.
+	 */
 	site = h713_mips_find_hdcp_wait();
 	if (site)
-		printf("H713 MIPS: HDCP wait site at 0x%08lx (not patched -- "
-		       "probe writes nothing)\n", site);
+		printf("H713 MIPS: HDCP 1.4 key-wait loop found at 0x%08lx "
+		       "(normal boot defuses it; the probe only locates it)\n",
+		       site);
 
 	if (h713_mips_fw && h713_mips_fw->panel)
 		printf("H713 probe: panel %ux%u, project 0x%02x\n",
