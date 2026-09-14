@@ -1,6 +1,20 @@
+# MagCubic HY310 (HY260_QZ713_V3.1) -- board base.
+#
+# This is what the board is. What a build is *for* comes from a role fragment
+# in configs/fragments/, merged on top with scripts/kconfig/merge_config.sh -m
+# and make olddefconfig; build/uboot-build.sh does both. Six builds of this
+# board exist and docs/uboot/README.md has the matrix.
+#
+# The base is the shipping build minus the three lines that make it the
+# shipping build: the power gate, the environment file and the boot command.
+# Everything else stays here, including the USB gadget and the eMMC
+# environment, because a fragment can switch those off and have every symbol
+# that hangs off them follow, while a fragment that switches them on leaves
+# their dependants at whatever the base already decided. Merged fragments
+# subtract reliably and add unreliably, so the base carries the superset.
 CONFIG_ARM=y
 CONFIG_ARCH_SUNXI=y
-CONFIG_DEFAULT_DEVICE_TREE="allwinner/sun50i-h713-hy200-qz713df-a1"
+CONFIG_DEFAULT_DEVICE_TREE="allwinner/sun50i-h713-hy310"
 CONFIG_DRAM_CLK=792
 CONFIG_SPL=y
 # DDR3 (type 3). The value set below is the bench board's; only the clock
@@ -34,7 +48,6 @@ CONFIG_DRAM_SUNXI_TPR12=0x00006666
 CONFIG_DRAM_SUNXI_TPR13=0xb4016103
 CONFIG_MACH_SUN50I_H713=y
 CONFIG_H713_POWERON_LIGHT_FAN=y
-CONFIG_H713_POWER_GATE=y
 CONFIG_H713_MIPS_BOOT=y
 CONFIG_SUNXI_DRAM_H713_DDR3_STOCK=y
 CONFIG_MMC_SUNXI_SLOT_EXTRA=2
@@ -66,5 +79,3 @@ CONFIG_SYS_MMCSD_RAW_MODE_U_BOOT_DATA_PART_OFFSET=0x0
 CONFIG_H713_VENDOR_CHAINLOAD=y
 CONFIG_CMD_WDT=y
 CONFIG_CMD_GPIO=y
-CONFIG_ENV_SOURCE_FILE="hy310"
-CONFIG_BOOTCOMMAND="h713_disp init ${h713_project}; run boot_${h713_boot}; run boot_net"
