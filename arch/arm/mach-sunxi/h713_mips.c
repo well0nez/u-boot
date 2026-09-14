@@ -348,23 +348,22 @@ static const struct h713_panel_cfg *h713_disp_panel = &h713_panel_cfg_board_b;
  * digest.
  */
 struct h713_mips_fw_rev {
-	const char *board;
 	/*
-	 * What the board says about itself *in software*. The project ID comes
-	 * from its own projecttable.TSE, which the firmware loads anyway, and
-	 * the digest pins the display.bin revision.
+	 * A row describes an *image*, and nothing else. The name is for people
+	 * -- the vendor device tree carries only model = "sun50iw12" on every
+	 * board in this family, so the silkscreen is all there is to call them
+	 * by -- and the three numbers are what the code can act on.
 	 *
-	 * The names are silkscreen and nothing reads them: the vendor device
-	 * tree carries only model = "sun50iw12", the same on every board in
-	 * this family. So the names are for people and these two numbers are
-	 * what the code can actually discriminate on.
+	 * What used to live here as well, the project ID and the panel, are
+	 * properties of the board. They left because one image serves two of
+	 * them: 22a7df11... runs the 720p HY300 T08 and the 1080p HY350. See
+	 * the panel table above.
 	 *
-	 * The panel belongs here for the same reason as the firmware fields:
-	 * it is a property of the device. A NULL panel means no description
-	 * exists yet and the default stands.
+	 * hdcp_wait_va zero means the site has never been located in this
+	 * image. It is searched for at run time either way; a non-zero value
+	 * is the cross-check, not the input.
 	 */
-	u32 project_id;
-	const struct h713_panel_cfg *panel;
+	const char *board;
 	ulong size;
 	ulong hdcp_wait_va;
 	u8 digest[SHA256_SUM_LEN];
@@ -374,8 +373,6 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 	{
 		/* Read from this board's own stock bootloader partition. */
 		.board = "HY200 QZ713DF_A1",
-		.project_id = 0x34,
-		.panel = &h713_panel_cfg_board_b,
 		.size = 0x132910,
 		.hdcp_wait_va = 0x4b13d6f8,
 		.digest = {
@@ -394,8 +391,6 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 		 * address is the one already documented for it.
 		 */
 		.board = "HY310 (QZ713 V3.1)",
-		.project_id = 0x30,
-		.panel = &h713_panel_cfg_hy310,
 		.size = 0x132b18,
 		.hdcp_wait_va = 0x4b13d0a4,
 		.digest = {
@@ -403,6 +398,52 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 			0xe6, 0x57, 0x82, 0x8f, 0xab, 0x65, 0x14, 0x5b,
 			0x14, 0x0a, 0xc9, 0x41, 0x1c, 0x40, 0xcc, 0xcc,
 			0x02, 0xee, 0xd2, 0x50, 0x47, 0x47, 0x2e, 0xe9,
+		},
+	},
+	{
+		/*
+		 * The ADT-3 family's image, from the HY300 T08 and HY350
+		 * firmware images of 2026-09-14: byte-identical in both, and
+		 * the reason a row cannot name a panel -- the T08 is 720p and
+		 * the HY350 1080p. It carries 13 ProjectID descriptors, 0x30
+		 * and 0x34 among them.
+		 *
+		 * Both ship it in vendor:/etc/display/mips/, not in
+		 * boot-resource, and Android copies it to bootloader_a/_b
+		 * (doku/121 2, finding 2).
+		 *
+		 * The wait site was located offline by the same search this
+		 * code runs, over the image itself (umbau/work/A5).
+		 */
+		.board = "ADT-3 2024",
+		.size = 0x131b20,
+		.hdcp_wait_va = 0x4b13d1f0,
+		.digest = {
+			0x22, 0xa7, 0xdf, 0x11, 0x3f, 0xce, 0x3f, 0xa1,
+			0x82, 0x92, 0x62, 0x68, 0xde, 0x8c, 0x75, 0x51,
+			0xa1, 0x07, 0xf0, 0xc3, 0xbc, 0x29, 0x32, 0xf0,
+			0x94, 0x0b, 0xd5, 0x8b, 0x8f, 0x42, 0x48, 0x35,
+		},
+	},
+	{
+		/*
+		 * The HY300 Pro's, build 24-5-7, from the size and SHA-256 its
+		 * owner reported in issue #1. Nobody here has the image, so
+		 * the wait site is unknown and stays zero: the search finds it
+		 * on the device, and there is nothing to cross-check it
+		 * against until someone posts a probe run.
+		 *
+		 * Without this row that board is refused on its size alone,
+		 * before anything has been read -- which is the refusal
+		 * doku/120 set out to remove.
+		 */
+		.board = "HY300 Pro",
+		.size = 0x131f10,
+		.digest = {
+			0xcf, 0x96, 0x49, 0xbc, 0xc8, 0x4a, 0x11, 0x1c,
+			0xe5, 0x90, 0xfc, 0x7a, 0xcd, 0xe7, 0x23, 0xc2,
+			0x55, 0x57, 0xfd, 0x23, 0x32, 0xab, 0xbb, 0x9f,
+			0xd1, 0x02, 0x25, 0x90, 0x5a, 0xae, 0x13, 0xa2,
 		},
 	},
 };
@@ -422,22 +463,6 @@ static const struct h713_mips_fw_rev *h713_mips_fw;
 static bool h713_probe_mode;
 
 /*
- * Two ways into the same table, because the two things that identify a board
- * arrive at different times: the display.bin digest only once the image is
- * loaded, the project ID as soon as a display command is typed.
- */
-static const struct h713_mips_fw_rev *h713_board_by_project(u32 project)
-{
-	uint i;
-
-	for (i = 0; i < ARRAY_SIZE(h713_mips_fw_revs); i++)
-		if (h713_mips_fw_revs[i].project_id == project)
-			return &h713_mips_fw_revs[i];
-
-	return NULL;
-}
-
-/*
  * The size is needed before the image can be hashed, so it starts at the
  * first row's value and is replaced by the file's own size once that is
  * known. h713_mips_clear_workspace() erases from the end of the firmware, and
@@ -446,10 +471,15 @@ static const struct h713_mips_fw_rev *h713_board_by_project(u32 project)
 static ulong h713_mips_fw_size = H713_MIPS_FW_SIZE;
 
 /*
- * Accept any size a known revision declares; the digest decides which one it
- * is. Refusing here on one revision's size turns an identity check into a size
- * check. Both loaders had arrived at the same conclusion separately, in two
- * copies of the same loop, so they now ask the same question in one place.
+ * Accept any size a known revision declares -- all four of them -- and let the
+ * digest decide which one it is. Refusing here on one revision's size turns an
+ * identity check into a size check. Both loaders had arrived at the same
+ * conclusion separately, in two copies of the same loop, so they now ask the
+ * same question in one place.
+ *
+ * This is the first gate a new board meets, so a row that exists only as a
+ * size and a digest (the HY300 Pro's) still earns its keep: without it that
+ * board is turned away before anything has been read from it.
  */
 static int h713_mips_accept_size(ulong len)
 {
@@ -5820,19 +5850,6 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 
 	printf("H713 disp: project 0x%02x -> prologue %u, timing %u, de %u\n",
 	       sel.project, sel.prologue, sel.timing, sel.de);
-
-	/*
-	 * Say so rather than silently obeying: the bench board's whole bring-up
-	 * ran 0x33 when the board declares 0x34, and nothing noticed. Which ID
-	 * a board declares is a property of the board, so read it off the
-	 * identified image instead of a constant -- the constant was the bench
-	 * board's 0x34 and told an HY310, which declares 0x30, that it was
-	 * something it is not, on every boot.
-	 */
-	if (h713_mips_fw && project != h713_mips_fw->project_id)
-		printf("H713 disp: note: this image is %s, which declares "
-		       "project 0x%02x\n",
-		       h713_mips_fw->board, h713_mips_fw->project_id);
 
 	ret = h713_disp_panel_patch(blob, &sel);
 	if (ret)
