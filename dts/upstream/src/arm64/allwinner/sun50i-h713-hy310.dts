@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * MagCubic HY310 projector, board silkscreen HY260_QZ713_V3.1.
+ *
+ * Electrically this is the bench board's device tree: DDR3, the same pin
+ * assignments, the same peripherals. What differs is the DRAM clock (792 MHz
+ * instead of 624, and that lives in the defconfig, not here) and the panel,
+ * which no node in this tree describes because the panel is driven by the
+ * display coprocessor's own tables.
+ *
+ * So the tree is an include, not a copy. The reason it exists at all is that
+ * a board should boot a device tree named after itself: until now the HY310
+ * shipped "sun50i-h713-hy200-qz713df-a1", which tells anyone reading a boot
+ * log that this is a board nobody has built for. Anything genuinely
+ * board-specific that we patched into the HY200 tree stays there for now;
+ * moving it out is a later cleanup, not this change.
+ */
+
+#include "sun50i-h713-hy200-qz713df-a1.dts"
+
+/ {
+	model = "MagCubic HY310 (HY260_QZ713_V3.1)";
+	compatible = "magcubic,hy310", "allwinner,sun50i-h713";
+};
