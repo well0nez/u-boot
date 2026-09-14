@@ -9,6 +9,7 @@
  */
 
 #include <command.h>
+#include <blk.h>
 #include <bmp_layout.h>
 #include <env.h>
 #include <console.h>
@@ -20,6 +21,7 @@
 #include <vsprintf.h>
 #include <sunxi_gpio.h>
 #include <linux/string.h>
+#include <asm/cache.h>
 #include <asm/io.h>
 #include <asm/unaligned.h>
 #include <u-boot/sha256.h>
@@ -363,6 +365,17 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 static const struct h713_mips_fw_rev *h713_mips_fw;
 
 /*
+ * Probe mode. The table above can only ever describe boards someone has held.
+ * A third device meets it as three refusals in a row -- unknown size, unknown
+ * digest, unknown patch site -- and every one of them fires before anything
+ * has been learned, so the owner is told "no" and nobody finds out what the
+ * board is. Under this flag those become findings instead: the command reads,
+ * hashes and reports, and refuses everything that would touch the panel or
+ * start the coprocessor. Probing describes, it does not experiment.
+ */
+static bool h713_probe_mode;
+
+/*
  * Two ways into the same table, because the two things that identify a board
  * arrive at different times: the display.bin digest only once the image is
  * loaded, the project ID as soon as a display command is typed.
@@ -403,9 +416,17 @@ static int h713_mips_accept_size(ulong len)
 		return 0;
 	}
 
-	printf("H713 MIPS: rejected size 0x%lx, no revision declares it\n", len);
+	if (!h713_probe_mode) {
+		printf("H713 MIPS: rejected size 0x%lx, no revision declares it\n",
+		       len);
+		return -EINVAL;
+	}
 
-	return -EINVAL;
+	printf("H713 MIPS: size 0x%lx is not in the table -- new revision\n",
+	       len);
+	h713_mips_fw_size = len;
+
+	return 0;
 }
 
 /*
@@ -3616,6 +3637,14 @@ static int h713_mips_verify(void)
 		return 0;
 	}
 
+	if (h713_probe_mode) {
+		printf("H713 MIPS: firmware identity unknown -- a revision this\n"
+		       "           build has never seen. Size 0x%lx and the\n"
+		       "           digest above are what a table row needs.\n",
+		       h713_mips_fw_size);
+		return 0;
+	}
+
 	printf("H713 MIPS: firmware identity rejected\n");
 	return -EPERM;
 }
@@ -4892,6 +4921,15 @@ static int h713_disp_lookup(ulong blob, u32 project,
 			       id, board->board, h713_disp_panel->width,
 			       h713_disp_panel->height,
 			       h713_mips_fw ? "" : " (by project ID -- guess)");
+		} else if (h713_probe_mode) {
+			/*
+			 * Nothing downstream may run on a guessed panel: the
+			 * register patches, the OSD geometry and the logo are
+			 * all sized from it.
+			 */
+			printf("H713 disp: no panel known for this image -- "
+			       "probe reports, it does not drive a panel\n");
+			return -ENOENT;
 		} else {
 			printf("H713 disp: project 0x%02x has no panel of its "
 			       "own -- keeping %ux%u\n", id,
@@ -11485,4 +11523,188 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp <blob-addr> <project-id> [nowait] - run against a staged blob\n"
 	   "h713_disp list <blob-addr>          - show every project's tables\n"
 	   "h713_disp dump [force]              - dump the display register blocks"
+);
+
+/*
+ * h713_probe -- say what this board is, and write nothing.
+ *
+ * Everything a board needs before it can be supported is one table row: the
+ * display.bin size and digest, the project ID, the panel, and the DRAM the
+ * vendor uses. All of it is readable. None of it needs a write, and none of
+ * it needs the board to be in this room -- which is the point, because the
+ * table can only ever describe boards someone has held, and the refusals it
+ * produces fire before the owner learns anything.
+ *
+ * What this deliberately does not do is start the coprocessor or light the
+ * panel. On an unidentified board the panel timing is a guess, and a guess
+ * belongs on a bench, not in someone's living room.
+ */
+
+#define H713_PROBE_BOOT0_LBA	16
+#define H713_PROBE_DRAM_OFF	0x38
+#define H713_PROBE_DRAM_WORDS	24
+
+static const char * const h713_probe_dram_names[H713_PROBE_DRAM_WORDS] = {
+	"clk", "type", "zq", "odt_en", "para1", "para2",
+	"mr0", "mr1", "mr2", "mr3",
+	"tpr0", "tpr1", "tpr2", "tpr3", "tpr4", "tpr5",
+	"tpr6", "tpr7", "tpr8", "tpr9", "tpr10", "tpr11", "tpr12", "tpr13",
+};
+
+static u8 h713_probe_sector[512] __aligned(ARCH_DMA_MINALIGN);
+
+/*
+ * The vendor's own DRAM settings, from the boot0 header on the eMMC. Not from
+ * the firmware image: the flash tool patches para2 and tpr13 on the way in, so
+ * the copy on the device is the one that describes the running board. What our
+ * builds ship is not this either -- tpr0..tpr2 are computed from the clock --
+ * but zq, para1, the mode registers and tpr3..tpr12 are taken from here
+ * verbatim, and tpr11/tpr12 are per-board PHY tuning that cannot be derived.
+ */
+static void h713_probe_boot0(int devnum)
+{
+	struct blk_desc *desc;
+	uint i;
+
+	printf("\n-- vendor boot0 (mmc %d, LBA %d) --\n",
+	       devnum, H713_PROBE_BOOT0_LBA);
+
+	desc = blk_get_devnum_by_uclass_id(UCLASS_MMC, devnum);
+	if (!desc) {
+		printf("   no mmc %d\n", devnum);
+		return;
+	}
+	if (blk_dread(desc, H713_PROBE_BOOT0_LBA, 1, h713_probe_sector) != 1) {
+		printf("   read failed\n");
+		return;
+	}
+	if (memcmp(h713_probe_sector + 4, "eGON.BT0", 8)) {
+		printf("   no eGON.BT0 header at LBA %d\n",
+		       H713_PROBE_BOOT0_LBA);
+		return;
+	}
+
+	for (i = 0; i < H713_PROBE_DRAM_WORDS; i++) {
+		u32 v = get_unaligned_le32(h713_probe_sector +
+					   H713_PROBE_DRAM_OFF + i * 4);
+
+		printf("   dram_%-6s 0x%08x%s", h713_probe_dram_names[i], v,
+		       i == 0 ? "   MHz: " : "\n");
+		if (i == 0)
+			printf("%u\n", v);
+	}
+}
+
+/*
+ * Where the vendor FAT sits is not the same on every layout: this board keeps
+ * it on the partition named hy310-boot, a stock device on bootloader_b, and
+ * bootloader_a holds a byte-identical copy. Trying the candidates in turn
+ * costs one failed open each and saves the owner from having to know.
+ */
+static const char * const h713_probe_devs[] = { "1:2", "1:1" };
+
+/* Set by the search below, consumed by the report. */
+static loff_t h713_probe_fw_len;
+
+static void h713_probe_report(void)
+{
+	loff_t len;
+	ulong site;
+
+	printf("H713 probe: read from %s %s:%s\n", H713_DISP_FS_IF,
+	       h713_disp_fs_dev(), h713_disp_fs_path());
+
+	if (h713_mips_accept_size((ulong)h713_probe_fw_len))
+		return;
+	/* Prints the digest and either the board name or "new revision". */
+	if (h713_mips_verify())
+		return;
+
+	site = h713_mips_find_hdcp_wait();
+	if (site)
+		printf("H713 MIPS: HDCP wait site at 0x%08lx (not patched -- "
+		       "probe writes nothing)\n", site);
+
+	if (h713_mips_fw && h713_mips_fw->panel)
+		printf("H713 probe: panel %ux%u, project 0x%02x\n",
+		       h713_mips_fw->panel->width, h713_mips_fw->panel->height,
+		       h713_mips_fw->project_id);
+	else
+		printf("H713 probe: panel unknown for this image -- it has to "
+		       "be measured on the board, it cannot be guessed\n");
+
+	if (h713_disp_read("LogoRegData.bin", H713_DISP_LOGO_ADDR, &len))
+		return;
+	h713_disp_list(H713_DISP_LOGO_ADDR);
+}
+
+static void h713_probe_display(void)
+{
+	const char *saved = env_get("h713_mips_dev");
+	char keep[16] = "";
+	bool found = false;
+	uint i;
+
+	if (saved)
+		strlcpy(keep, saved, sizeof(keep));
+
+	printf("\n-- display artifacts --\n");
+
+	found = !h713_disp_read("display.bin", H713_MIPS_FW_ADDR,
+				&h713_probe_fw_len);
+	for (i = 0; !found && i < ARRAY_SIZE(h713_probe_devs); i++) {
+		if (keep[0] && !strcmp(keep, h713_probe_devs[i]))
+			continue;
+		printf("H713 probe: trying %s %s instead\n",
+		       H713_DISP_FS_IF, h713_probe_devs[i]);
+		env_set("h713_mips_dev", h713_probe_devs[i]);
+		found = !h713_disp_read("display.bin", H713_MIPS_FW_ADDR,
+					&h713_probe_fw_len);
+	}
+
+	if (found)
+		h713_probe_report();
+	else
+		printf("H713 probe: no display.bin found. Set h713_mips_dev "
+		       "to the partition holding the vendor FAT and run "
+		       "h713_probe again.\n");
+
+	env_set("h713_mips_dev", keep[0] ? keep : NULL);
+}
+
+static int do_h713_probe(struct cmd_tbl *cmdtp, int flag, int argc,
+			 char *const argv[])
+{
+	bool war = h713_probe_mode;
+
+	if (argc != 1)
+		return CMD_RET_USAGE;
+
+	printf("H713 probe: reading only -- nothing is written to the eMMC,\n"
+	       "            the coprocessor stays in reset, the panel stays "
+	       "dark.\n");
+
+	h713_probe_mode = true;
+
+	printf("\n-- partitions (mmc 1) --\n");
+	run_command("part list mmc 1", 0);
+
+	h713_probe_boot0(1);
+	h713_probe_display();
+
+	h713_probe_mode = war;
+
+	printf("\nH713 probe: done. Paste everything above into the issue.\n");
+
+	return CMD_RET_SUCCESS;
+}
+
+U_BOOT_CMD(h713_probe, 1, 0, do_h713_probe,
+	   "report what this board is, without writing anything",
+	   "\n"
+	   "    Reads the vendor boot0 DRAM settings, the partition table and\n"
+	   "    the display firmware, and prints what a support table row would\n"
+	   "    need: size, SHA-256, project IDs, panel, HDCP wait site.\n"
+	   "    An unknown firmware revision is a result here, not a refusal.\n"
+	   "    Nothing is written and the panel is never driven."
 );
