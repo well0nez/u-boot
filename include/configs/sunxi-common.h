@@ -354,6 +354,27 @@
 	"switch_vendor=" H713_SWITCH_VENDOR_COMMAND "\0"
 
 /*
+ * "run fel" reboots into FEL without touching the reset button: it sets the
+ * vendor's efex flag in RTC GP2, which our SPL checks first thing and answers
+ * by jumping into the BROM's FEL entry (arch-sunxi/boot0.h). RTC registers sit
+ * on a slow clock: the vendor writes the flag until it reads back and then
+ * waits 500 ms before the watchdog reset. A single store right before "reset"
+ * was lost once in four tries, so do the same here.
+ *
+ * It lives here rather than in hy310.env because only three builds load that
+ * file. The installer, the probe and the FEL-to-eMMC builds use none, so they
+ * had no way back to FEL but the button -- which is exactly where you are when
+ * one of them is running. Every H713 build gets this block.
+ *
+ * What the flag is answered by is the SPL on the eMMC, not the one that is
+ * running: after the reset the BROM loads LBA 16. On a stock device that is the
+ * vendor's boot0, which honours the same flag.
+ */
+#define H713_FEL_ENV_SETTINGS \
+	"fel=while itest.l *0x07090108 != 0x5aa5a55a; do " \
+	"mw.l 0x07090108 0x5aa5a55a; done; sleep 1; reset\0"
+
+/*
  * The BROM-loaded first stage is a single raw image at LBA 0x10 (not slotted).
  * Provide it under a non-slotted alias "uboot" as well as "bootloader":
  * slot-aware fastboot hosts auto-append the A/B suffix to "bootloader" and end
@@ -383,6 +404,7 @@
 	"fastboot_raw_partition_ubootp=0x800 0x2800\0" \
 	"fastboot_raw_partition_splstash=0x3880 0x40\0" \
 	H713_SWITCH_ENV_SETTINGS \
+	H713_FEL_ENV_SETTINGS \
 	H713_FASTBOOT_MODE_ENV_SETTINGS
 #else
 #define H713_SWITCH_VENDOR_COMMAND ""
