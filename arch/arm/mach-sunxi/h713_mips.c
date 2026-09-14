@@ -5135,7 +5135,6 @@ static int h713_disp_stock_panel_power(void)
  * LogoRegData replay, and the ProjectID_*.TSE payloads -- which differ by 2688
  * bytes and feed the MIPS -- are not exercised by any test we have.
  */
-#define H713_DISP_BOARD_PROJECT_ID	0x34
 
 struct h713_panel_patch {
 	u32 reg;
@@ -5781,14 +5780,17 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 	       sel.project, sel.prologue, sel.timing, sel.de);
 
 	/*
-	 * Say so rather than silently obeying. This board declares 0x34 in both
-	 * panel_config.ini and stock's own log, and the whole bring-up ran 0x33
-	 * without anything noticing.
+	 * Say so rather than silently obeying: the bench board's whole bring-up
+	 * ran 0x33 when the board declares 0x34, and nothing noticed. Which ID
+	 * a board declares is a property of the board, so read it off the
+	 * identified image instead of a constant -- the constant was the bench
+	 * board's 0x34 and told an HY310, which declares 0x30, that it was
+	 * something it is not, on every boot.
 	 */
-	if (project != H713_DISP_BOARD_PROJECT_ID)
-		printf("H713 disp: note: this board declares project 0x%02x "
-		       "(panel_config.ini ProjectID = 52)\n",
-		       H713_DISP_BOARD_PROJECT_ID);
+	if (h713_mips_fw && project != h713_mips_fw->project_id)
+		printf("H713 disp: note: this image is %s, which declares "
+		       "project 0x%02x\n",
+		       h713_mips_fw->board, h713_mips_fw->project_id);
 
 	ret = h713_disp_panel_patch(blob, &sel);
 	if (ret)
@@ -11441,8 +11443,9 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 
 U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "run stock's fastlogo display sequence for a project ID",
-	   "this board's project ID is 0x34 (panel_config.ini ProjectID = 52, and\n"
-	   "stock's own log); 0x33 renders identically but prefer 0x34 for new work\n"
+	   "the project ID is the board's, not this build's: an HY310 declares\n"
+	   "0x30, the HY200 bench board 0x34 (0x33 renders identically there).\n"
+	   "h713_probe reads it off the device.\n"
 	   "test <project-id> [source] [level] [mode] - load, patch, run, sample, log\n"
 	   "                                      level 0..5 (ASSERT..VERBOSE), default 3\n"
 	   "                                      mode 0=sync 1=async 2=buf, default 2\n"
