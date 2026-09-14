@@ -12473,7 +12473,14 @@ static void h713_probe_profile_row(void)
 	else
 		printf("hdcp_wait_va: not found\n");
 
-	printf("active_slot: %s\n",
+	/*
+	 * active_slot is what misc says ("_a"/"_b"; "_a" when there is no misc
+	 * or no control block), the same meaning the installer's identify()
+	 * gives that key. Where the artifacts were actually read from is the
+	 * next line, since on our layout that is neither slot.
+	 */
+	printf("active_slot: %s\n", h713_disp_slot_suffix());
+	printf("mips.source: %s %s\n", H713_DISP_FS_IF,
 	       h713_probe_dev_used[0] ? h713_probe_dev_used : "none");
 
 	h713_probe_row_slot("mips.bootloader_a", "1#bootloader_a", da, &la, &ra);
