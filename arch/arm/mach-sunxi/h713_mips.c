@@ -288,7 +288,51 @@ static const struct h713_panel_cfg h713_panel_cfg_hy310 = {
 };
 
 /*
- * The panel in force. Set from the board table once a display command knows
+ * The panel, by declared project ID.
+ *
+ * The ID is what a board says about itself, in panel_config.ini and in the
+ * name of the ProjectID_*.TSE group its firmware loads, and it is the only
+ * thing on the device that names the panel. The display.bin digest does not:
+ * one image, 22a7df11..., ships on the 720p HY300 T08 and on the 1080p HY350,
+ * which declare 0x34 and 0x30 (doku/121 2, finding 3). The digest identifies a
+ * firmware revision -- its size and its HDCP wait site -- and that is all.
+ *
+ * 0x34 is the 1280x720 single-port panel: this is the bench board's, and the
+ * HY300 T08's panel_config.ini states exactly the same raster -- HTotal 1360,
+ * VTotal 760, Hsync 20, Vsync 2, HBP 40, VBP 20, both polarities 0, DCLK 62
+ * MHz, which is the 61.71 MHz the PLL sweep settled on. Its backlight is PWM
+ * channel 5 at 40 kHz where the HY310 uses channel 2 at 25 kHz; nothing here
+ * models that, and h713_disp_backlight_set() is still pinned to PWM2 on PB4.
+ *
+ * 0x30 is the 1920x1080 dual-port panel, as read off a live HY310.
+ *
+ * What the table does NOT claim is that a project ID fixes the raster across
+ * boards: the HY350 declares 0x30 as well, and its panel_config.ini asks for
+ * 2200x1125 at 148.5 MHz where the HY310 asks for 2128x1120 at 143.0 MHz.
+ * Same resolution, same port count, different blanking. A board we have never
+ * driven gets a profile of its own before it gets an entry here.
+ */
+static const struct {
+	u32 project;
+	const struct h713_panel_cfg *panel;
+} h713_disp_panels[] = {
+	{ 0x30, &h713_panel_cfg_hy310 },
+	{ 0x34, &h713_panel_cfg_board_b },
+};
+
+static const struct h713_panel_cfg *h713_panel_by_project(u32 project)
+{
+	uint i;
+
+	for (i = 0; i < ARRAY_SIZE(h713_disp_panels); i++)
+		if (h713_disp_panels[i].project == project)
+			return h713_disp_panels[i].panel;
+
+	return NULL;
+}
+
+/*
+ * The panel in force. Set from the table above once a display command knows
  * its project ID; board B's until then, so the diagnostics that run before any
  * selection keep the geometry they were written against.
  */
@@ -4875,7 +4919,7 @@ static bool h713_disp_configured;
 static int h713_disp_lookup(ulong blob, u32 project,
 			    struct h713_disp_sel *sel)
 {
-	const struct h713_mips_fw_rev *board;
+	const struct h713_panel_cfg *panel;
 	int i;
 
 	for (i = 0; i < h713_disp_desc_count(blob); i++) {
@@ -4904,25 +4948,21 @@ static int h713_disp_lookup(ulong blob, u32 project,
 		}
 
 		/*
-		 * Which panel is fitted is a property of the device, and the
-		 * digest is what identifies the device -- the project ID only
-		 * picks a TSE group, and several boards can share one. Both
-		 * boards in the table happen to have an ID of their own, which
-		 * made the two look interchangeable; a third board with
-		 * project 0x34 and a 1080p panel would have been driven with
-		 * the bench board's 720p timing on that assumption. So take
-		 * the panel from the identified image, and fall back to the
-		 * project ID only when the image is unknown -- saying that it
-		 * is a guess. Everything downstream reads the panel from here:
-		 * the register patch table, the OSD geometry, the logo.
+		 * The declared project ID is what names the panel, and it is
+		 * the ID this run was given -- from the environment, from
+		 * panel_config.ini, or from the operator. Not the display.bin
+		 * digest: one image serves both panels, so choosing by digest
+		 * would drive an HY350 with the HY310's raster the moment
+		 * their shared firmware was identified. Everything downstream
+		 * reads the panel from here: the register patch table, the OSD
+		 * geometry, the logo.
 		 */
-		board = h713_mips_fw ? h713_mips_fw : h713_board_by_project(id);
-		if (board && board->panel) {
-			h713_disp_panel = board->panel;
-			printf("H713 disp: project 0x%02x is %s, panel %ux%u%s\n",
-			       id, board->board, h713_disp_panel->width,
-			       h713_disp_panel->height,
-			       h713_mips_fw ? "" : " (by project ID -- guess)");
+		panel = h713_panel_by_project(id);
+		if (panel) {
+			h713_disp_panel = panel;
+			printf("H713 disp: project 0x%02x, panel %ux%u %s-port\n",
+			       id, panel->width, panel->height,
+			       panel->dual_port ? "dual" : "single");
 		} else if (h713_probe_mode) {
 			/*
 			 * Nothing downstream may run on a guessed panel: the
@@ -11917,6 +11957,7 @@ static void h713_probe_report(void)
 {
 	loff_t len;
 	ulong site;
+	u32 project;
 
 	printf("H713 probe: read from %s %s:%s\n", H713_DISP_FS_IF,
 	       h713_disp_fs_dev(), h713_disp_fs_path());
@@ -11938,13 +11979,27 @@ static void h713_probe_report(void)
 		       "(normal boot defuses it; the probe only locates it)\n",
 		       site);
 
-	if (h713_mips_fw && h713_mips_fw->panel)
-		printf("H713 probe: panel %ux%u, project 0x%02x\n",
-		       h713_mips_fw->panel->width, h713_mips_fw->panel->height,
-		       h713_mips_fw->project_id);
-	else
-		printf("H713 probe: panel unknown for this image -- it has to "
-		       "be measured on the board, it cannot be guessed\n");
+	/*
+	 * The panel follows the ID the board declares, so report the ID, where
+	 * it was read, and what this build knows about it. An ID with no panel
+	 * is the interesting case and the reason the probe exists: it is a row
+	 * nobody has filled in yet, not a fault.
+	 */
+	if (!h713_disp_declared_project(&project)) {
+		const struct h713_panel_cfg *panel =
+			h713_panel_by_project(project);
+
+		if (panel)
+			printf("H713 probe: project 0x%02x, panel %ux%u "
+			       "%s-port\n", project, panel->width,
+			       panel->height,
+			       panel->dual_port ? "dual" : "single");
+		else
+			printf("H713 probe: project 0x%02x is not in this "
+			       "build's panel table -- the panel has to be "
+			       "measured on the board, it cannot be guessed\n",
+			       project);
+	}
 
 	if (h713_disp_read("LogoRegData.bin", H713_DISP_LOGO_ADDR, &len))
 		return;
