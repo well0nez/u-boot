@@ -47,11 +47,39 @@
 
 #define H713_MIPS_CLK_VALUE		0x80000002
 #define H713_MIPS_CLK_DISABLED		0x00000000
+
+/*
+ * The reset ladder, with the vendor's own names for its rungs.
+ *
+ * 0x0200160c is the MIPS bus-gating-and-reset register, and the vendor device
+ * tree names every bit in it. mipsloader@3061000 declares
+ *
+ *	resets      = <&ccu 1>, <&ccu 2>, <&ccu 3>;
+ *	reset-names = "bus-reset", "cold-reset", "soft-reset";
+ *	clocks      = <&ccu 27>, <&ccu 26>;
+ *	clock-names = "bus-clk", "mips-clk";
+ *
+ * and entries 1/2/3 of sun50iw12_ccu_resets are bits 16, 17 and 18 of this
+ * register (A7 report, 5). Bit 0 is the bus-clk gate, as in every other
+ * Allwinner BGR register. So the stages are, in the order the kernel's
+ * mips_reset() issues them:
+ *
+ *	0x00000000  everything asserted, gate off -- the parked state
+ *	0x00010000  bus-reset deasserted
+ *	0x00030000  cold-reset deasserted as well
+ *	0x00030001  bus clock gated on
+ *	0x00070001  soft-reset deasserted: the core starts fetching
+ *
+ * The last line is what the vendor kernel's ioctl start does and nothing
+ * else: mips_reset() brings the first four up, and the "start" opcode of
+ * ioctl 0x10648 writes the boot address and then deasserts bit 18. That is
+ * why we write 0x03061030 immediately before it.
+ */
 #define H713_MIPS_RESET_ASSERTED	0x00000000
-#define H713_MIPS_RESET_STAGE1		0x00010000
-#define H713_MIPS_RESET_STAGE2		0x00030000
-#define H713_MIPS_RESET_STAGE3		0x00030001
-#define H713_MIPS_RESET_RELEASED	0x00070001
+#define H713_MIPS_RESET_STAGE1		0x00010000	/* bus-reset    */
+#define H713_MIPS_RESET_STAGE2		0x00030000	/* + cold-reset */
+#define H713_MIPS_RESET_STAGE3		0x00030001	/* + bus clock  */
+#define H713_MIPS_RESET_RELEASED	0x00070001	/* + soft-reset */
 #define H713_MIPS_STATUS_RELEASED	0x00000001
 
 /*
@@ -3658,6 +3686,12 @@ static void h713_mips_print_trace(void)
 				   H713_MIPS_SHMEM_CALL_NEXT_OFF));
 }
 
+/*
+ * The whole ladder in one place: clock, then bus-reset, cold-reset, bus gate,
+ * and finally soft-reset with the boot address already written. The stages and
+ * their order are the vendor kernel's mips_reset() exactly; see the reset
+ * register's own comment for which bit is which.
+ */
 static int h713_mips_release_reset(bool publish_shmem)
 {
 	writel(H713_MIPS_CLK_VALUE, H713_MIPS_CLK_REG);
