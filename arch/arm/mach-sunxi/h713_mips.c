@@ -10,6 +10,7 @@
 
 #include <command.h>
 #include <blk.h>
+#include <sunxi_image.h>
 #include <bmp_layout.h>
 #include <env.h>
 #include <console.h>
@@ -11543,7 +11544,6 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
  * belongs on a bench, not in someone's living room.
  */
 
-#define H713_PROBE_BOOT0_LBA	16
 #define H713_PROBE_DRAM_OFF	0x38
 #define H713_PROBE_DRAM_WORDS	24
 
@@ -11563,48 +11563,105 @@ static u8 h713_probe_sector[512] __aligned(ARCH_DMA_MINALIGN);
  * builds ship is not this either -- tpr0..tpr2 are computed from the clock --
  * but zq, para1, the mode registers and tpr3..tpr12 are taken from here
  * verbatim, and tpr11/tpr12 are per-board PHY tuning that cannot be derived.
+ *
+ * The BootROM reads boot0 from LBA 16 and falls back to LBA 256, and a stock
+ * device carries it in both. A device this port was installed on does not: LBA
+ * 16 holds our SPL and LBA 256 went with the rest of the image (doku/109). Our
+ * SPL has an eGON.BT0 header too, so the magic alone lets it through -- the
+ * first run on an HY310 printed the SPL's device-tree name as DRAM settings.
+ * Mainline marks its header with "SPL" at 0x14, where boot0 keeps its header
+ * size, and a real DRAM block has a sane clock and type; check both.
  */
+static const lbaint_t h713_probe_boot0_lbas[] = { 16, 256 };
+
+static bool h713_probe_sector_empty(void)
+{
+	uint i;
+
+	for (i = 0; i < sizeof(h713_probe_sector); i++)
+		if (h713_probe_sector[i])
+			return false;
+
+	return true;
+}
+
+static bool h713_probe_dram_plausible(void)
+{
+	u32 clk = get_unaligned_le32(h713_probe_sector + H713_PROBE_DRAM_OFF);
+	u32 type = get_unaligned_le32(h713_probe_sector +
+				      H713_PROBE_DRAM_OFF + 4);
+
+	/* DDR2, DDR3, LPDDR3; clocks the H713 DRAM code accepts. */
+	return clk >= 300 && clk <= 1200 &&
+	       (type == 2 || type == 3 || type == 7);
+}
+
 static void h713_probe_boot0(int devnum)
 {
 	struct blk_desc *desc;
-	uint i;
+	uint n, i;
 
-	printf("\n-- vendor boot0 (mmc %d, LBA %d) --\n",
-	       devnum, H713_PROBE_BOOT0_LBA);
+	printf("\n-- vendor boot0 (mmc %d) --\n", devnum);
 
 	desc = blk_get_devnum_by_uclass_id(UCLASS_MMC, devnum);
 	if (!desc) {
 		printf("   no mmc %d\n", devnum);
 		return;
 	}
-	if (blk_dread(desc, H713_PROBE_BOOT0_LBA, 1, h713_probe_sector) != 1) {
-		printf("   read failed\n");
-		return;
-	}
-	if (memcmp(h713_probe_sector + 4, "eGON.BT0", 8)) {
-		printf("   no eGON.BT0 header at LBA %d\n",
-		       H713_PROBE_BOOT0_LBA);
+
+	for (n = 0; n < ARRAY_SIZE(h713_probe_boot0_lbas); n++) {
+		lbaint_t lba = h713_probe_boot0_lbas[n];
+
+		if (blk_dread(desc, lba, 1, h713_probe_sector) != 1) {
+			printf("   LBA %lu: read failed\n", (ulong)lba);
+			continue;
+		}
+		if (memcmp(h713_probe_sector + 4, "eGON.BT0", 8)) {
+			printf("   LBA %lu: %s\n", (ulong)lba,
+			       h713_probe_sector_empty() ? "empty" :
+			       "no boot0 header");
+			continue;
+		}
+		if (!memcmp(h713_probe_sector + 0x14, SPL_SIGNATURE, 3)) {
+			printf("   LBA %lu: a mainline U-Boot SPL, not the "
+			       "vendor boot0\n", (ulong)lba);
+			continue;
+		}
+		if (!h713_probe_dram_plausible()) {
+			printf("   LBA %lu: boot0 header, but nothing at 0x%x "
+			       "looks like DRAM settings\n", (ulong)lba,
+			       H713_PROBE_DRAM_OFF);
+			continue;
+		}
+
+		printf("   LBA %lu: vendor boot0\n", (ulong)lba);
+		for (i = 0; i < H713_PROBE_DRAM_WORDS; i++) {
+			u32 v = get_unaligned_le32(h713_probe_sector +
+						   H713_PROBE_DRAM_OFF + i * 4);
+
+			printf("   dram_%-6s 0x%08x", h713_probe_dram_names[i],
+			       v);
+			if (i == 0)
+				printf("   %u MHz", v);
+			printf("\n");
+		}
 		return;
 	}
 
-	for (i = 0; i < H713_PROBE_DRAM_WORDS; i++) {
-		u32 v = get_unaligned_le32(h713_probe_sector +
-					   H713_PROBE_DRAM_OFF + i * 4);
-
-		printf("   dram_%-6s 0x%08x%s", h713_probe_dram_names[i], v,
-		       i == 0 ? "   MHz: " : "\n");
-		if (i == 0)
-			printf("%u\n", v);
-	}
+	printf("   no vendor boot0 left on this eMMC -- it has been replaced.\n"
+	       "   The DRAM settings are still in the stock firmware image or\n"
+	       "   in a dump taken before the replacement.\n");
 }
 
 /*
- * Where the vendor FAT sits is not the same on every layout: this board keeps
- * it on the partition named hy310-boot, a stock device on bootloader_b, and
- * bootloader_a holds a byte-identical copy. Trying the candidates in turn
- * costs one failed open each and saves the owner from having to know.
+ * Where the vendor FAT sits is not the same on every layout: a stock device
+ * keeps it on bootloader_b, bootloader_a holds a byte-identical copy, and a
+ * device this port was installed on has the files on hy310-boot. Stock
+ * first, since that is who the probe is for; each miss costs one failed open.
+ * The first attempt uses whatever the environment resolves to, and that one
+ * is not tried twice.
  */
-static const char * const h713_probe_devs[] = { "1:2", "1:1" };
+static const char * const h713_probe_devs[] = { "1:2", "1:1", "1#hy310-boot" };
 
 /* Set by the search below, consumed by the report. */
 static loff_t h713_probe_fw_len;
@@ -11645,18 +11702,20 @@ static void h713_probe_display(void)
 {
 	const char *saved = env_get("h713_mips_dev");
 	char keep[16] = "";
-	bool found = false;
+	char tried[16];
+	bool found;
 	uint i;
 
 	if (saved)
 		strlcpy(keep, saved, sizeof(keep));
+	strlcpy(tried, h713_disp_fs_dev(), sizeof(tried));
 
 	printf("\n-- display artifacts --\n");
 
 	found = !h713_disp_read("display.bin", H713_MIPS_FW_ADDR,
 				&h713_probe_fw_len);
 	for (i = 0; !found && i < ARRAY_SIZE(h713_probe_devs); i++) {
-		if (keep[0] && !strcmp(keep, h713_probe_devs[i]))
+		if (!strcmp(tried, h713_probe_devs[i]))
 			continue;
 		printf("H713 probe: trying %s %s instead\n",
 		       H713_DISP_FS_IF, h713_probe_devs[i]);
