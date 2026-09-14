@@ -6176,7 +6176,7 @@ static struct blk_desc *h713_disp_blk(void)
 	return blk_get_devnum_by_uclass_id(UCLASS_MMC, H713_DISP_MMC_DEV);
 }
 
-static const char *h713_disp_slot_suffix(void)
+static const char *h713_disp_read_slot(void)
 {
 	static u8 sector[512] __aligned(ARCH_DMA_MINALIGN);
 	struct blk_desc *desc = h713_disp_blk();
@@ -6193,6 +6193,23 @@ static const char *h713_disp_slot_suffix(void)
 		return "_a";
 
 	return (sector[0] == '_' && sector[1] == 'b') ? "_b" : "_a";
+}
+
+/*
+ * Asked once. Finding a partition by name walks the GPT entry by entry, and
+ * every entry re-reads the header and the whole entry array, so each lookup
+ * costs on the order of a hundred transfers -- and this one sits behind every
+ * other lookup. The slot cannot change while we are running: Android rewrites
+ * misc, and then the board reboots.
+ */
+static const char *h713_disp_slot_suffix(void)
+{
+	static const char *cached;
+
+	if (!cached)
+		cached = h713_disp_read_slot();
+
+	return cached;
 }
 
 /*
@@ -6466,8 +6483,26 @@ static int h713_disp_read(const char *name, ulong addr, loff_t *len)
  * bootloader partition alone would silently miss. On our layout there is no
  * media_data partition, so the attempt costs one GPT lookup and prints nothing.
  */
-static const struct h713_disp_part h713_disp_oem_part = { "media_data", true };
+/* Unslotted in all three vendor layouts, unlike Reserve0 next to it. */
+static const struct h713_disp_part h713_disp_oem_part = {
+	"media_data", false
+};
 #define H713_DISP_TSE_LAST_RESORT	"ProjectID_0x0012.TSE"
+
+/* Also asked once, and for the same reason: it is a GPT walk per load. */
+static const char *h713_disp_oem_dev(void)
+{
+	static char dev[24];
+	static bool asked;
+
+	if (!asked) {
+		asked = true;
+		if (!h713_disp_part_dev(&h713_disp_oem_part, dev, sizeof(dev)))
+			dev[0] = '\0';
+	}
+
+	return dev[0] ? dev : NULL;
+}
 
 static int h713_disp_read_tse(const char *oem, const char *name, ulong addr,
 			      loff_t *len)
@@ -6506,17 +6541,13 @@ static int h713_disp_load_tse(u32 project)
 		"database.TSE", "pq_custom.TSE",
 		"projecttable.TSE",
 	};
+	const char *oem = h713_disp_oem_dev();
 	char pid[40];
-	char oem_dev[24];
-	const char *oem;
 	ulong addr = H713_MIPS_TSE_ADDR;
 	loff_t len;
 	int i, ret;
 
 	memset((void *)H713_MIPS_TSE_ADDR, 0, H713_MIPS_TSE_SIZE);
-
-	oem = h713_disp_part_dev(&h713_disp_oem_part, oem_dev,
-				 sizeof(oem_dev));
 
 	for (i = 0; i < ARRAY_SIZE(fixed); i++) {
 		ret = h713_disp_read_tse(oem, fixed[i], addr, &len);
