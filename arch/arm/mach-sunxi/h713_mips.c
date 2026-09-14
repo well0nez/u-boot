@@ -45,6 +45,30 @@
 #define H713_MIPS_SHARE_SIZE_REG	0x03061028UL
 #define H713_MIPS_BOOTADDR_REG		0x03061030UL
 
+/*
+ * The MIPS core clock: gate on, parent 0, no pre-divider, M = 2.
+ *
+ * bit 31 gates SCLK, bits 26:24 select the parent, bits 9:8 are the power-of-
+ * two pre-divider and bits 4:0 the divider M, which divides by M+1. 0x80000002
+ * is therefore parent 0 divided by three, and parent 0 of a module clock in
+ * this CCU is PLL_PERI(2X). Our own SPL programs PLL6 with CCM_PLL6_DEFAULT
+ * 0xa8003100 for the H713 -- N+1 = 50, both output dividers 1, so 24 MHz * 50
+ * / 2 = 600 MHz on the 1X output and 1200 MHz on the 2X.
+ *
+ *	1200 MHz / 3 = 400 MHz
+ *
+ * which is exactly what the vendor kernel asks for: sunxi-mipsloader calls
+ * clk_set_rate(mips_clk, 0x17d78400) -- 400000000 -- on its very first
+ * mips_reset(), i.e. after we have already started the core (A7 report, 5).
+ * The rate we hand over is the rate it wants, so its call is a no-op and there
+ * is nothing to change here. Had the two disagreed, the driver would have
+ * re-rated a running coprocessor.
+ *
+ * The arithmetic assumes the standard sun50iw12 module-clock encoding; the
+ * exact match with the vendor's 400 MHz is what makes that reading credible,
+ * and it is the only cross-check available without the CCU driver's parent
+ * table.
+ */
 #define H713_MIPS_CLK_VALUE		0x80000002
 #define H713_MIPS_CLK_DISABLED		0x00000000
 
