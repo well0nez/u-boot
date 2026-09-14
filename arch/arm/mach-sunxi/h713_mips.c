@@ -3755,13 +3755,80 @@ static int h713_mips_start(void)
  *
  * The address is firmware-specific: the same loop sits at 0x4b13d0a4 in the
  * revision found in an earlier captured dump and at 0x4b13d6f8 in the image
- * this board actually carries. The guard below compares the instruction before
- * writing, so a wrong offset reports rather than corrupting the firmware.
+ * this board actually carries.
+ *
+ * One constant per revision does not reach past the boards we own. A third
+ * device cannot be helped until someone with that device reads the address
+ * out, and reading it out needs the very command the missing address blocks.
+ * So find the site in the image instead. The instruction is "sltiu v1,v1,0x33"
+ * (0x2c630033), and on this board's image it occurs twice -- once in
+ * Rx_HDCP14_LoadKey, once in an unrelated function. Context tells them apart:
+ * only the real site has the polled register 0x06840093 built nearby, as the
+ * halves a MIPS lui/ori pair leaves in the instruction stream. Measured on
+ * display.bin 16c74a28...: the hit at 0x4b13d0a4 has both halves within 1 KiB,
+ * the one at 0x4b161478 has neither. The pinned addresses stay in the table,
+ * as a check on the search rather than as its input.
  */
-/* The first row's site; the fallback for an unidentified image. */
-#define H713_MIPS_HDCP_WAIT_INSN	0x4b13d6f8UL
 #define H713_MIPS_HDCP_WAIT_ORIG	0x2c630033
 #define H713_MIPS_HDCP_WAIT_NONE	0x2c630000
+/* Halves of the HDMI-RX register 0x06840093 the loop polls, and how far
+ * either side of a candidate to look for them. */
+#define H713_MIPS_HDCP_CTX_HI		0x0684
+#define H713_MIPS_HDCP_CTX_LO		0x0093
+#define H713_MIPS_HDCP_CTX_WIN		0x400UL
+
+static bool h713_mips_hdcp_context(ulong va)
+{
+	ulong first = H713_MIPS_FW_ADDR;
+	ulong last = H713_MIPS_FW_ADDR + h713_mips_fw_size;
+	ulong from = (va - first > H713_MIPS_HDCP_CTX_WIN)
+		     ? va - H713_MIPS_HDCP_CTX_WIN : first;
+	ulong to = min(va + H713_MIPS_HDCP_CTX_WIN, last);
+	bool hi = false, lo = false;
+	ulong p;
+
+	for (p = from; p + 2 <= to; p += 2) {
+		u16 half = readw(p);
+
+		if (half == H713_MIPS_HDCP_CTX_HI)
+			hi = true;
+		else if (half == H713_MIPS_HDCP_CTX_LO)
+			lo = true;
+	}
+
+	return hi && lo;
+}
+
+/* Zero on failure, with the reason printed: no caller can act on it. */
+static ulong h713_mips_find_hdcp_wait(void)
+{
+	ulong found = 0;
+	uint hits = 0;
+	ulong p;
+
+	for (p = H713_MIPS_FW_ADDR;
+	     p + 4 <= H713_MIPS_FW_ADDR + h713_mips_fw_size; p += 4) {
+		if (readl(p) != H713_MIPS_HDCP_WAIT_ORIG)
+			continue;
+		hits++;
+		if (!h713_mips_hdcp_context(p))
+			continue;
+		if (found) {
+			printf("H713 MIPS: HDCP wait site is ambiguous -- "
+			       "0x%08lx and 0x%08lx both look right\n",
+			       found, p);
+			return 0;
+		}
+		found = p;
+	}
+
+	if (!found)
+		printf("H713 MIPS: no HDCP wait site found (%u candidate%s "
+		       "had the instruction, none the context)\n",
+		       hits, hits == 1 ? "" : "s");
+
+	return found;
+}
 
 static int h713_mips_release_raw(bool skip_hdcp_wait, bool publish_shmem,
 				 bool trace, bool stability, bool comm_trace)
@@ -3781,15 +3848,15 @@ static int h713_mips_release_raw(bool skip_hdcp_wait, bool publish_shmem,
 		return -EINVAL;
 
 	if (skip_hdcp_wait) {
-		ulong va = h713_mips_fw ? h713_mips_fw->hdcp_wait_va
-					: H713_MIPS_HDCP_WAIT_INSN;
-		u32 insn = readl(va);
+		ulong pinned = h713_mips_fw ? h713_mips_fw->hdcp_wait_va : 0;
+		ulong va = h713_mips_find_hdcp_wait();
 
-		if (insn != H713_MIPS_HDCP_WAIT_ORIG) {
-			printf("H713 MIPS: HDCP wait site 0x%08lx is 0x%08x, expected 0x%08x\n",
-			       va, insn, H713_MIPS_HDCP_WAIT_ORIG);
+		if (!va)
 			return -EINVAL;
-		}
+		if (pinned && pinned != va)
+			printf("H713 MIPS: HDCP wait site found at 0x%08lx but "
+			       "the table says 0x%08lx -- using the search\n",
+			       va, pinned);
 		writel(H713_MIPS_HDCP_WAIT_NONE, va);
 		printf("H713 MIPS: HDCP key-load wait defeated at 0x%08lx\n",
 		       va);
