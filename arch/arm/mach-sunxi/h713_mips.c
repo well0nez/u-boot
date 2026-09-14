@@ -5264,12 +5264,18 @@ static int h713_disp_stock_panel_power(void)
 
 
 /*
- * This board's project ID, and it comes from the same panel_config.ini the
- * struct above transcribes: "ProjectID = 52", which is 0x34.
+ * A note about project 0x33, kept because the results that rest on it are
+ * still quoted. It is about the bench board, board B, and about nothing else:
+ * this used to introduce a compiled-in H713_DISP_BOARD_PROJECT_ID, which was
+ * that board's 0x34 and wrong on every other one. The constant went in
+ * 218792f; the sentence that called it "this board's" outlived it. Which
+ * project a board declares is now read from the board -- h713_project, or its
+ * panel_config.ini -- and the panel follows from it.
  *
- * Bring-up ran 0x33 throughout, on no evidence. Stock's own log settles it --
- * "Project id:0x34 version:25-1-6-3", then mips/ProjectID_0x0034.TSE -- so the
- * config file and the running firmware agree, and 0x33 was a guess.
+ * Board B declares 0x34, in the panel_config.ini the struct above transcribes
+ * ("ProjectID = 52") and in stock's own log -- "Project id:0x34
+ * version:25-1-6-3", then mips/ProjectID_0x0034.TSE. Its bring-up here ran
+ * 0x33 throughout, on no evidence, so 0x33 was a guess.
  *
  * It is a guess that cost nothing, which was checked rather than assumed: an
  * A/B on 2026-08-06 found 0x33 and 0x34 select the same prologue and timing
@@ -5277,9 +5283,9 @@ static int h713_disp_stock_panel_power(void)
  * patch table has run. The panel is indistinguishable. So every 0x33 result
  * stands; see docs/mips-display-recovery.md.
  *
- * Prefer this for new work anyway. That equivalence covers the ARM's
- * LogoRegData replay, and the ProjectID_*.TSE payloads -- which differ by 2688
- * bytes and feed the MIPS -- are not exercised by any test we have.
+ * Prefer 0x34 for new work on that board anyway. The equivalence covers the
+ * ARM's LogoRegData replay, and the ProjectID_*.TSE payloads -- which differ by
+ * 2688 bytes and feed the MIPS -- are not exercised by any test we have.
  */
 
 struct h713_panel_patch {
