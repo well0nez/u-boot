@@ -6082,49 +6082,63 @@ static const char *h713_disp_slot_suffix(void)
  * and a load does five reads. An mmc rescan onto a differently partitioned card
  * therefore keeps the first answer; set h713_mips_dev if that ever matters.
  */
-static const struct {
-	const char *name;
-	bool slotted;
-} h713_disp_parts[] = {
+struct h713_disp_part { const char *name; bool slotted; };
+
+static const struct h713_disp_part h713_disp_parts[] = {
 	{ "bootloader", true },
 	{ "hy310-boot", false },
 };
 
+/*
+ * "1#<name>" for the first form of this partition the GPT actually has, or
+ * NULL. A slotted name is tried with the misc slot appended first, as stock
+ * does, and then bare, because a layout without A/B carries the bare name.
+ */
+static const char *h713_disp_part_dev(const struct h713_disp_part *part,
+				      char *out, size_t outlen)
+{
+	struct blk_desc *desc = h713_disp_blk();
+	struct disk_partition info;
+	char name[PART_NAME_LEN];
+
+	if (!desc)
+		return NULL;
+
+	if (part->slotted) {
+		snprintf(name, sizeof(name), "%s%s", part->name,
+			 h713_disp_slot_suffix());
+		if (part_get_info_by_name(desc, name, &info) >= 0) {
+			snprintf(out, outlen, "%d#%s", H713_DISP_MMC_DEV, name);
+			return out;
+		}
+	}
+
+	if (part_get_info_by_name(desc, part->name, &info) < 0)
+		return NULL;
+
+	snprintf(out, outlen, "%d#%s", H713_DISP_MMC_DEV, part->name);
+
+	return out;
+}
+
 static const char *h713_disp_resolve_dev(void)
 {
 	static char resolved[24];
-	struct blk_desc *desc;
-	struct disk_partition info;
-	char name[PART_NAME_LEN];
 	uint i;
 
 	if (resolved[0])
 		return resolved;
 
-	desc = h713_disp_blk();
-	if (!desc)
-		return H713_DISP_FS_DEV;
-
 	for (i = 0; i < ARRAY_SIZE(h713_disp_parts); i++) {
-		if (h713_disp_parts[i].slotted) {
-			snprintf(name, sizeof(name), "%s%s",
-				 h713_disp_parts[i].name,
-				 h713_disp_slot_suffix());
-			if (part_get_info_by_name(desc, name, &info) >= 0)
-				goto found;
-		}
-		strlcpy(name, h713_disp_parts[i].name, sizeof(name));
-		if (part_get_info_by_name(desc, name, &info) >= 0)
-			goto found;
+		if (!h713_disp_part_dev(&h713_disp_parts[i], resolved,
+					sizeof(resolved)))
+			continue;
+		printf("H713 disp: artifacts on %s %s, found by name\n",
+		       H713_DISP_FS_IF, resolved);
+		return resolved;
 	}
 
 	return H713_DISP_FS_DEV;
-
-found:
-	snprintf(resolved, sizeof(resolved), "%d#%s", H713_DISP_MMC_DEV, name);
-	printf("H713 disp: artifacts partition %s, by name\n", name);
-
-	return resolved;
 }
 
 /*
@@ -6149,6 +6163,110 @@ static const char *h713_disp_fs_path(void)
 	const char *s = env_get("h713_mips_path");
 
 	return s && *s ? s : H713_DISP_FS_PATH;
+}
+
+/*
+ * The declared project ID: which ProjectID_*.TSE group the firmware loads,
+ * and -- through the panel table -- which panel is fitted.
+ *
+ * It is a property of the board, and two places on the board state it:
+ *
+ *  1. the environment, h713_project. On our layout that is the answer. The
+ *     installer writes it at install time from the device's own
+ *     panel_config.ini, and the boot script hands it to "h713_disp init".
+ *  2. panel_config.ini itself, which the vendor keeps on Reserve0 and mirrors
+ *     to media_data (/oem) -- "ProjectID = 52", in decimal, where the TSE file
+ *     names and this code are hexadecimal. This is the stock case and the
+ *     probe's: a device nobody has installed onto has no environment of ours,
+ *     and still knows what it is.
+ *
+ * Deliberately not from the display.bin digest. One image serves both panels:
+ * 22a7df11... is the firmware of the 720p HY300 T08 *and* of the 1080p HY350,
+ * which declare 0x34 and 0x30 (doku/121 2, finding 3). The image identifies a
+ * firmware revision, not a board.
+ */
+#define H713_DISP_PANEL_INI	"panel_config.ini"
+#define H713_DISP_INI_MAX	4096
+
+static const struct h713_disp_part h713_disp_ini_parts[] = {
+	{ "Reserve0", true },
+	{ "media_data", true },
+};
+
+static int h713_disp_ini_project(const char *dev, u32 *project)
+{
+	static u8 ini[H713_DISP_INI_MAX] __aligned(ARCH_DMA_MINALIGN);
+	loff_t len = 0;
+	ulong p, q;
+	u32 val;
+
+	if (fs_set_blk_dev(H713_DISP_FS_IF, dev, FS_TYPE_ANY))
+		return -ENODEV;
+	if (fs_read(H713_DISP_PANEL_INI, (ulong)ini, 0, sizeof(ini), &len))
+		return -ENOENT;
+
+	/*
+	 * Line-oriented and deliberately dumb: the key has to start a line, so
+	 * a commented-out one cannot be mistaken for the setting. Everything
+	 * else in the file is somebody else's business.
+	 */
+	for (p = 0; p + sizeof("ProjectID") <= (ulong)len; p++) {
+		if (p && ini[p - 1] != '\n' && ini[p - 1] != '\r')
+			continue;
+		if (memcmp(&ini[p], "ProjectID", strlen("ProjectID")))
+			continue;
+
+		q = p + strlen("ProjectID");
+		while (q < (ulong)len && (ini[q] == ' ' || ini[q] == '\t'))
+			q++;
+		if (q >= (ulong)len || ini[q] != '=')
+			continue;
+		q++;
+		while (q < (ulong)len && (ini[q] == ' ' || ini[q] == '\t'))
+			q++;
+		if (q >= (ulong)len || ini[q] < '0' || ini[q] > '9')
+			continue;
+
+		for (val = 0; q < (ulong)len && ini[q] >= '0' && ini[q] <= '9';
+		     q++)
+			val = val * 10 + (ini[q] - '0');
+		*project = val;
+
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int h713_disp_declared_project(u32 *project)
+{
+	const char *s = env_get("h713_project");
+	char dev[24];
+	uint i;
+
+	if (s && *s) {
+		*project = hextoul(s, NULL);
+		return 0;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(h713_disp_ini_parts); i++) {
+		if (!h713_disp_part_dev(&h713_disp_ini_parts[i], dev,
+					sizeof(dev)))
+			continue;
+		if (h713_disp_ini_project(dev, project))
+			continue;
+
+		printf("H713 disp: project 0x%02x, from %s on %s %s\n",
+		       *project, H713_DISP_PANEL_INI, H713_DISP_FS_IF, dev);
+		return 0;
+	}
+
+	printf("H713 disp: this board does not say which project it is.\n"
+	       "           h713_project is unset and no %s was readable.\n"
+	       "           Give it on the command line: h713_disp init <id>\n",
+	       H713_DISP_PANEL_INI);
+
+	return -ENOENT;
 }
 /*
  * Above the framebuffer window (which ends at 0x4d941000) and below the
@@ -11286,27 +11404,40 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return CMD_RET_SUCCESS;
 	}
 
-	if (argc >= 3 && argc <= 5 && !strcmp(argv[1], "init")) {
-		u32 project = hextoul(argv[2], NULL);
-		bool noboot = false, quiesce = false;
+	if (argc >= 2 && argc <= 5 && !strcmp(argv[1], "init")) {
+		bool noboot = false, quiesce = false, have_id = false;
+		u32 project = 0;
 		int elog = -1;
 		int i;
 
-		for (i = 3; i < argc; i++) {
+		/*
+		 * The project ID is optional now, and the first token that is
+		 * not a flag. "h713_disp init ${h713_project}" with the
+		 * variable unset expands to exactly this, so a device whose
+		 * environment has not been told what it is asks the board.
+		 */
+		for (i = 2; i < argc; i++) {
 			if (!strcmp(argv[i], "noboot"))
 				noboot = true;
 			else if (!strcmp(argv[i], "quiesce"))
 				quiesce = true;
 			else if (!strncmp(argv[i], "elog=", 5))
 				elog = (int)dectoul(argv[i] + 5, NULL);
-			else
+			else if (!have_id) {
+				project = hextoul(argv[i], NULL);
+				have_id = true;
+			} else {
 				return CMD_RET_USAGE;
+			}
 		}
 		if (elog > 5) {
 			printf("H713 disp: elog level %d out of range "
 			       "(0 assert .. 5 verbose)\n", elog);
 			return CMD_RET_USAGE;
 		}
+		if (!have_id && h713_disp_declared_project(&project))
+			return CMD_RET_FAILURE;
+
 		return h713_disp_init_only(project, !noboot, quiesce, elog) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
@@ -11572,7 +11703,9 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
 	   "h713_disp commtrace                 - read the CPU_COMM trace stage\n"
-	   "h713_disp init <project-id> [noboot|quiesce] [elog=<0-5>]\n"
+	   "h713_disp init [project-id] [noboot|quiesce] [elog=<0-5>]\n"
+	   "    without an ID: env h713_project, else panel_config.ini on\n"
+	   "    Reserve0 or media_data (ProjectID is decimal there).\n"
 	   "    elog turns on the coprocessor's own log (ring mode 1).\n"
 	   "    Needs a reader draining it, or it fills and stops.\n"
 	   "                                    - bring the display up and stop, ready for diagnostics\n"
