@@ -480,10 +480,10 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 	{
 		/*
 		 * The HY300 Pro's, build 24-5-7, from the size and SHA-256 its
-		 * owner reported in issue #1. Nobody here has the image, so
-		 * the wait site is unknown and stays zero: the search finds it
-		 * on the device, and there is nothing to cross-check it
-		 * against until someone posts a probe run.
+		 * owner reported in issue #1. Nobody here has the image; the
+		 * wait site is the one the probe found on his device
+		 * (issue #1, probe run of 2026-09-14), so the run-time search
+		 * now has something to agree with.
 		 *
 		 * Without this row that board is refused on its size alone,
 		 * before anything has been read -- which is the refusal
@@ -491,6 +491,7 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 		 */
 		.board = "HY300 Pro",
 		.size = 0x131f10,
+		.hdcp_wait_va = 0x4b13d1b0,
 		.digest = {
 			0xcf, 0x96, 0x49, 0xbc, 0xc8, 0x4a, 0x11, 0x1c,
 			0xe5, 0x90, 0xfc, 0x7a, 0xcd, 0xe7, 0x23, 0xc2,
