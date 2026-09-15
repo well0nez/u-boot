@@ -7816,11 +7816,18 @@ static int h713_disp_publish_bmp(bool load, const char *path,
 	int ret;
 
 	if (load) {
-		ret = fs_set_blk_dev(H713_DISP_FS_IF, H713_DISP_FS_DEV,
-				     FS_TYPE_ANY);
+		/*
+		 * The logo lives where the display artifacts live: the stock
+		 * FAT on a stock device, hy310-boot on an installed one. The
+		 * fixed "1:2" this used to name is the raw U-Boot partition on
+		 * our layout, which has no filesystem at all.
+		 */
+		const char *dev = h713_disp_fs_dev();
+
+		ret = fs_set_blk_dev(H713_DISP_FS_IF, dev, FS_TYPE_ANY);
 		if (ret) {
 			printf("H713 panel: cannot select %s %s for %s\n",
-			       H713_DISP_FS_IF, H713_DISP_FS_DEV, path);
+			       H713_DISP_FS_IF, dev, path);
 			return ret;
 		}
 		ret = fs_read(path, H713_DISP_VENDOR_BMP_ADDR, 0,
@@ -11036,9 +11043,27 @@ static int h713_disp_call_table(uint raw_entries)
  * for the register diagnostics -- nothing may follow them but a power cycle,
  * and in particular not a kernel.
  */
+/*
+ * logo: put the boot logo on the panel WITHOUT parking the MIPS.
+ *
+ * `auto <id> logo` renders the logo and then quiesces the coprocessor as its
+ * last act, which is why an installed HY310 boots with `init` and a blank
+ * panel: Linux needs the firmware alive for cpu_comm, SetSource and the HDMI
+ * switch (doku/67, doku/124). This path does what the KMS driver does a
+ * second later with its console: fill the OSD framebuffer, and after the
+ * firmware has proven readiness re-arm AFBD channel 1 with the same status
+ * clear, control bit and READY write. No DE replay, no quiesce, no timing
+ * latch beyond the one init already does. The buffer is filled before the
+ * firmware starts so the first frame DE block 5 scans out is already the
+ * logo, not whatever DRAM held.
+ *
+ * A missing or refused logo is a warning, never a failed init: the boot must
+ * go on exactly as without the word "logo".
+ */
 static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce,
-			       int elog_level)
+			       int elog_level, bool logo, const char *logo_file)
 {
+	bool logo_up = false;
 	int ret;
 
 	/*
@@ -11076,6 +11101,18 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce,
 		h713_cfg_set_tag("level", '0' + elog_level, "elog level");
 	}
 
+	if (logo) {
+		if (logo_file)
+			ret = h713_disp_publish_bmp(true, logo_file, false, false);
+		else
+			ret = h713_disp_publish_vendor_bootlogo(true, false);
+		if (ret)
+			printf("H713 disp: WARNING: no boot logo (%d); "
+			       "continuing without one\n", ret);
+		else
+			logo_up = true;
+	}
+
 	ret = h713_disp_run(H713_DISP_LOGO_ADDR, project, true, true, false,
 			    false, false, true, release_mips);
 	if (ret)
@@ -11086,6 +11123,26 @@ static int h713_disp_init_only(u32 project, bool release_mips, bool quiesce,
 		h713_disp_probe_contested("MIPS quiesced");
 	}
 	h713_disp_latch_panel_timing();
+
+	if (logo_up) {
+		/*
+		 * Publish once more from the BMP still at its load address: if
+		 * the record replay or the firmware start touched the OSD buffer,
+		 * the panel would otherwise show DRAM until Linux. Then the same
+		 * re-arm the KMS driver does for its console.
+		 */
+		if (logo_file)
+			h713_disp_publish_bmp(false, logo_file, false, false);
+		else
+			h713_disp_publish_vendor_bootlogo(false, false);
+		h713_disp_commit_osd_frame();
+		printf("H713 disp: boot logo up at 0x%08lx with the firmware "
+		       "%s; MIPS reset=%08x status=%08x scan=%08x\n",
+		       H713_DISP_OSD_FB_ADDR,
+		       quiesce ? "quiesced" : "running",
+		       readl(H713_MIPS_RESET_REG), readl(H713_MIPS_STATUS_REG),
+		       readl(H713_DISP_LVDS_SCAN_REG));
+	}
 
 	printf("H713 disp: display initialised%s; scanrate, regscan and "
 	       "clkfind can run now. Power-cycle before another init.\n",
@@ -11686,8 +11743,10 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		return CMD_RET_SUCCESS;
 	}
 
-	if (argc >= 2 && argc <= 5 && !strcmp(argv[1], "init")) {
+	if (argc >= 2 && argc <= 7 && !strcmp(argv[1], "init")) {
 		bool noboot = false, quiesce = false, have_id = false;
+		bool logo = false;
+		const char *logo_file = NULL;
 		u32 project = 0;
 		int elog = -1;
 		int i;
@@ -11705,6 +11764,13 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 				quiesce = true;
 			else if (!strncmp(argv[i], "elog=", 5))
 				elog = (int)dectoul(argv[i] + 5, NULL);
+			else if (!strcmp(argv[i], "logo"))
+				logo = true;
+			else if (logo && !logo_file)
+				/* A token after "logo" is a custom BMP on the
+				 * artifact filesystem, published without the
+				 * vendor hash. The project ID goes before it. */
+				logo_file = argv[i];
 			else if (!have_id) {
 				project = hextoul(argv[i], NULL);
 				have_id = true;
@@ -11720,7 +11786,8 @@ static int do_h713_disp(struct cmd_tbl *cmdtp, int flag, int argc,
 		if (!have_id && h713_disp_declared_project(&project))
 			return CMD_RET_FAILURE;
 
-		return h713_disp_init_only(project, !noboot, quiesce, elog) ?
+		return h713_disp_init_only(project, !noboot, quiesce, elog,
+					   logo, logo_file) ?
 		       CMD_RET_FAILURE : CMD_RET_SUCCESS;
 	}
 
@@ -11985,7 +12052,9 @@ U_BOOT_CMD(h713_disp, 15, 0, do_h713_disp,
 	   "h713_disp calltable [raw-entries]   - read the live CPU_COMM call table\n"
 	   "h713_disp commstate                 - read the CPU_COMM transports\n"
 	   "h713_disp commtrace                 - read the CPU_COMM trace stage\n"
-	   "h713_disp init [project-id] [noboot|quiesce] [elog=<0-5>]\n"
+	   "h713_disp init [project-id] [noboot|quiesce] [elog=<0-5>] [logo [file.bmp]]\n"
+	   "                                      logo: boot logo on the panel with the firmware RUNNING (the\n"
+	   "                                            product boot with a picture; a missing logo only warns)\n"
 	   "    without an ID: env h713_project, else panel_config.ini on\n"
 	   "    Reserve0 or media_data (ProjectID is decimal there).\n"
 	   "    elog turns on the coprocessor's own log (ring mode 1).\n"
