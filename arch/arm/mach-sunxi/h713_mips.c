@@ -499,6 +499,33 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 			0xd1, 0x02, 0x25, 0x90, 0x5a, 0xae, 0x13, 0xa2,
 		},
 	},
+	{
+		/*
+		 * From one of the two vendor "HY300 Pro+" images of 2025, the
+		 * 0710 one: an LPDDR3 board at 720 MHz. Its display.bin is
+		 * the image, and the image is all we have -- it is a firmware
+		 * download, not a device anybody here or in issue #1 owns, so
+		 * the name is the image's and not a board's.
+		 *
+		 * The wait site was located offline by the same search this
+		 * code runs at run time, over the extracted file (file offset
+		 * 0x3d538), so the search has something to agree with.
+		 *
+		 * Note what this row is *not*: it is not the HY300 Pro above.
+		 * That board is DDR3 at 636 MHz and carries cf9649bc...; this
+		 * is a different image on different memory, and the two share
+		 * only a marketing name.
+		 */
+		.board = "HY300 Pro+ 2025 (LPDDR3)",
+		.size = 0x1328f0,
+		.hdcp_wait_va = 0x4b13d538,
+		.digest = {
+			0x46, 0x28, 0xcb, 0xaf, 0x8c, 0x93, 0xea, 0x12,
+			0xec, 0x59, 0xe8, 0x71, 0xe4, 0x25, 0x0f, 0xac,
+			0xf0, 0x77, 0x3d, 0xaa, 0xe7, 0x22, 0xb2, 0x51,
+			0xc7, 0x3f, 0x1f, 0xad, 0x81, 0xe8, 0x0c, 0x2c,
+		},
+	},
 };
 
 /* Set by h713_mips_verify() once the image is identified. */
@@ -524,7 +551,7 @@ static bool h713_probe_mode;
 static ulong h713_mips_fw_size = H713_MIPS_FW_SIZE;
 
 /*
- * Accept any size a known revision declares -- all four of them -- and let the
+ * Accept any size a known revision declares -- all five of them -- and let the
  * digest decide which one it is. Refusing here on one revision's size turns an
  * identity check into a size check. Both loaders had arrived at the same
  * conclusion separately, in two copies of the same loop, so they now ask the
