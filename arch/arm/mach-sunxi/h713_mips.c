@@ -8335,9 +8335,20 @@ static void h713_disp_latch_panel_timing(void)
 	udelay(1);
 	writel(ctl & ~BIT(0), 0x0588000c);
 
-	printf("H713 panel: timing latched: %08x %08x %08x %08x %08x %08x\n",
+	/*
+	 * The second half of the line is what the next owner's log needs so the
+	 * two rasters can be compared without a register dump: the polarities
+	 * the row asks for, the raw totals, and what the minus-one convention
+	 * makes of them in the mixer and DE records -- read back, not assumed.
+	 */
+	printf("H713 panel: timing latched: %08x %08x %08x %08x %08x %08x; "
+	       "sync pol h%u v%u; DE totals %ux%u written as %ux%u "
+	       "(mixer %08x de %08x)\n",
 	       readl(0x0588001c), readl(0x05880020), readl(0x05880024),
-	       readl(0x05880028), readl(0x0588002c), readl(0x05880030));
+	       readl(0x05880028), readl(0x0588002c), readl(0x05880030),
+	       c->hsync_pol, c->vsync_pol, c->htotal, c->vtotal,
+	       c->htotal - 1, c->vtotal - 1,
+	       readl(0x0525c000), readl(0x0524c010));
 }
 
 /*
