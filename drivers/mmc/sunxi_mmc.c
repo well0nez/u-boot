@@ -877,7 +877,16 @@ struct mmc *sunxi_mmc_init(int sdc_no)
 		cfg->host_caps = MMC_MODE_8BIT;
 
 	cfg->host_caps |= MMC_MODE_HS_52MHz | MMC_MODE_HS;
-	cfg->b_max = CONFIG_SYS_MMC_MAX_BLK_COUNT;
+	/*
+	 * One command has to fit into one descriptor chain, as in the DM probe
+	 * below.  Without the IDMA this is CONFIG_SYS_MMC_MAX_BLK_COUNT again
+	 * and nothing changes.  It matters here because the SPL's largest read
+	 * is the U-Boot image: 1724 blocks today, but a chain that cannot hold
+	 * the whole command would take that read back to the PIO path without
+	 * saying so, and mmc_bread() splits at b_max for free.
+	 */
+	cfg->b_max = min_t(unsigned int, CONFIG_SYS_MMC_MAX_BLK_COUNT,
+			   SUNXI_MMC_IDMA_MAX_BLOCKS);
 
 	cfg->f_min = 400000;
 	cfg->f_max = 52000000;
