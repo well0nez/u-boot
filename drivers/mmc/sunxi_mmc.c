@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <log.h>
 #include <malloc.h>
+#include <memalign.h>
 #include <mmc.h>
 #include <clk.h>
 #include <reset.h>
@@ -549,15 +550,16 @@ static int mmc_finish_dma(struct sunxi_mmc_priv *priv, struct mmc_data *data,
 /*
  * The fixed 120 ms of the PIO path only ever had to cover the tail of a
  * transfer the CPU had already moved.  With the IDMA the whole transfer
- * happens inside this wait, so use the same budget the PIO loop gives
- * itself: one millisecond per 64 bytes, at least two seconds.  An error
- * still leaves mmc_rint_wait() immediately, this only bounds a silent hang.
+ * happens inside this wait, so it has to scale: one millisecond per 256
+ * bytes, which is the budget mmc_trans_data_by_cpu() gives itself
+ * (word_cnt >> 6), but never less than the 120 ms of before.  An error
+ * still leaves mmc_rint_wait() immediately; this only bounds a silent hang.
  */
 static uint sunxi_mmc_dma_timeout(unsigned int bytecnt)
 {
-	uint timeout_msecs = bytecnt >> 6;
+	uint timeout_msecs = bytecnt >> 8;
 
-	return timeout_msecs < 2000 ? 2000 : timeout_msecs;
+	return timeout_msecs < 120 ? 120 : timeout_msecs;
 }
 
 #else /* !MMC_SUNXI_IDMA */
@@ -961,10 +963,96 @@ static int sunxi_mmc_getcd(struct udevice *dev)
 	return 1;
 }
 
+#if CONFIG_IS_ENABLED(MMC_SUPPORTS_TUNING)
+/*
+ * The MMC core refuses HS200 and HS400 unless the host offers a tuning
+ * step, so here it is. The Linux driver for this controller has none: its
+ * sunxi_mmc_calibrate() writes the sample delay line to step 0 with the
+ * software enable bit and leaves it there for every mode, and that is what
+ * carries this eMMC to HS400 on this board. mmc_config_clock() above
+ * already does exactly that, so start by confirming step 0 holds.
+ *
+ * Only if it does not do we look further. The vendor U-Boot searches too
+ * (sunxi_tuning_speed_mode at 0x4a01f378: it programs a delay, reads a
+ * pattern back and keeps the middle of the widest run that passed), but it
+ * reads back a pattern of its own that it first WROTE to the card at block
+ * 0x5fc0 (sunxi_read_tuning at 0x4a01eb78, sunxi_mmc_tuning_init at
+ * 0x4a01ef44). We will not write to anybody's eMMC to find a delay, so the
+ * pattern here is the card's own tuning block, fetched with the opcode the
+ * core hands us - the same search over the same delay line, read only.
+ */
+static int sunxi_mmc_read_tuning_block(struct sunxi_mmc_priv *priv,
+				       struct mmc *mmc, uint opcode)
+{
+	ALLOC_CACHE_ALIGN_BUFFER(u8, buf, 128);
+	struct mmc_cmd cmd;
+	struct mmc_data data;
+
+	cmd.cmdidx = opcode;
+	cmd.cmdarg = 0;
+	cmd.resp_type = MMC_RSP_R1;
+
+	/* 128 bytes on an 8 bit bus, 64 on a 4 bit one (JEDEC 84-B51). */
+	data.dest = (char *)buf;
+	data.blocks = 1;
+	data.blocksize = mmc->bus_width == 8 ? 128 : 64;
+	data.flags = MMC_DATA_READ;
+
+	return sunxi_mmc_send_cmd_common(priv, mmc, &cmd, &data);
+}
+
+static void sunxi_mmc_set_samp_dl(struct sunxi_mmc_priv *priv, uint step)
+{
+	writel(SUNXI_MMC_CAL_DL_SW_EN | (step & SUNXI_MMC_CAL_DL_SW_MASK),
+	       &priv->reg->samp_dl);
+}
+
+static int sunxi_mmc_execute_tuning(struct udevice *dev, uint opcode)
+{
+	struct sunxi_mmc_plat *plat = dev_get_plat(dev);
+	struct sunxi_mmc_priv *priv = dev_get_priv(dev);
+	struct mmc *mmc = &plat->mmc;
+	uint step, run = 0, best_len = 0, best_end = 0;
+
+	sunxi_mmc_set_samp_dl(priv, 0);
+	if (!sunxi_mmc_read_tuning_block(priv, mmc, opcode))
+		return 0;
+
+	for (step = 0; step < SUNXI_MMC_CAL_DL_STEPS; step++) {
+		sunxi_mmc_set_samp_dl(priv, step);
+		if (sunxi_mmc_read_tuning_block(priv, mmc, opcode)) {
+			run = 0;
+			continue;
+		}
+		if (++run > best_len) {
+			best_len = run;
+			best_end = step;
+		}
+	}
+
+	if (!best_len) {
+		/* Back to the setting Linux uses; the core drops a mode. */
+		sunxi_mmc_set_samp_dl(priv, 0);
+		debug("mmc %u: no sample delay passed tuning\n", priv->mmc_no);
+		return -EIO;
+	}
+
+	step = best_end - best_len / 2;
+	sunxi_mmc_set_samp_dl(priv, step);
+	debug("mmc %u: sample delay %u, window %u..%u\n", priv->mmc_no, step,
+	      best_end + 1 - best_len, best_end);
+
+	return 0;
+}
+#endif /* MMC_SUPPORTS_TUNING */
+
 static const struct dm_mmc_ops sunxi_mmc_ops = {
 	.send_cmd	= sunxi_mmc_send_cmd,
 	.set_ios	= sunxi_mmc_set_ios,
 	.get_cd		= sunxi_mmc_getcd,
+#if CONFIG_IS_ENABLED(MMC_SUPPORTS_TUNING)
+	.execute_tuning	= sunxi_mmc_execute_tuning,
+#endif
 };
 
 static unsigned get_mclk_offset(void)
@@ -1008,6 +1096,16 @@ static int sunxi_mmc_probe(struct udevice *dev)
 	ret = mmc_of_parse(dev, cfg);
 	if (ret)
 		return ret;
+
+	/*
+	 * f_max above stands for the 52 MHz of MMC high speed, which is all
+	 * this driver used to reach. A node that asks for HS200 wants the
+	 * 200 MHz that goes with it; every slower mode stays capped by its
+	 * own frequency, so this only lifts the ceiling.
+	 */
+	if (CONFIG_IS_ENABLED(MMC_HS200_SUPPORT) &&
+	    (cfg->host_caps & MMC_MODE_HS200))
+		cfg->f_max = 200000000;
 
 	priv->reg = dev_read_addr_ptr(dev);
 

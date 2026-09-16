@@ -185,6 +185,13 @@ struct sunxi_idma_desc {
 #define SUNXI_MMC_THLDC_WRITE_EN	(0x1 << 2)
 #define SUNXI_MMC_THLDC_READ_THLD(x)	(((x) & 0xfff) << 16)
 
+/*
+ * Sample delay line, register 0x144. Bit 7 makes the controller use the
+ * software value in bits 5..0 instead of its own calibration result; the
+ * line has 64 steps. Linux sunxi-mmc, SDXC_CAL_DL_SW_EN and SDXC_CAL_DL_MASK.
+ */
 #define SUNXI_MMC_CAL_DL_SW_EN		(0x1 << 7)
+#define SUNXI_MMC_CAL_DL_SW_MASK	0x3f
+#define SUNXI_MMC_CAL_DL_STEPS		64
 
 #endif /* _SUNXI_MMC_H */
