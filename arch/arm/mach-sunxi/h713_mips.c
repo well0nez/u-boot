@@ -5080,12 +5080,29 @@ struct h713_disp_sel {
 	struct h713_disp_block prologue_range, timing_range, de_range;
 };
 
-/* The container's length, from the four words of its own header. */
+/*
+ * The container's length, from the four words of its own header:
+ *   0x10 + 0x0168 + 0x24 + 0x3b88 = 15652, the HY310's file
+ *   0x10 + 0x0138 + 0x24 + 0x36c8 = 14388, the HY300 Pro's
+ * Zero if this is not a LogoRegData container or the length is not credible.
+ * Every offset the replay uses is bounded by this, so a file we do not
+ * understand yields no groups at all rather than a walk over open DRAM --
+ * which is the fault this whole change is about.
+ */
+#define H713_DISP_HDR_MAGIC	0x6f676f6cU	/* "logo" */
+#define H713_DISP_MAX_SIZE	0x100000UL	/* both known files are ~15 KiB */
+
 static ulong h713_disp_size(ulong blob)
 {
-	return H713_DISP_DESC_OFF + readw(blob + H713_DISP_HDR_TABLE_LEN) +
-	       readw(blob + H713_DISP_HDR_HEAD_LEN) +
-	       readl(blob + H713_DISP_HDR_REST);
+	ulong size = H713_DISP_DESC_OFF +
+		     readw(blob + H713_DISP_HDR_TABLE_LEN) +
+		     readw(blob + H713_DISP_HDR_HEAD_LEN) +
+		     readl(blob + H713_DISP_HDR_REST);
+
+	if (readl(blob) != H713_DISP_HDR_MAGIC || size > H713_DISP_MAX_SIZE)
+		return 0;
+
+	return size;
 }
 
 /*
