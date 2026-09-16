@@ -138,6 +138,44 @@ struct sunxi_mmc {
 #define SUNXI_MMC_IDIE_TXIRQ		(0x1 << 0)
 #define SUNXI_MMC_IDIE_RXIRQ		(0x1 << 1)
 
+/*
+ * One entry of the internal DMA controller's descriptor chain. The
+ * controller reads the chain from main memory, so the layout is fixed by
+ * the hardware and every field is little endian.
+ *
+ * Source: Linux sunxi-mmc, struct sunxi_idma_des, and the vendor U-Boot
+ * 2018.05 for the H713 (hy310-u-boot.fex, sunxi_mmc_do_send_cmd_common at
+ * 0x4a01db68), which builds exactly this 16 byte record.
+ */
+struct sunxi_idma_desc {
+	__le32 config;		/* 0x0 flags and ownership */
+	__le32 buf_size;	/* 0x4 bytes in this buffer */
+	__le32 buf_addr;	/* 0x8 buffer address */
+	__le32 next_desc;	/* 0xc address of the next descriptor */
+};
+
+/* Bits of struct sunxi_idma_desc.config, Linux SDXC_IDMAC_DES0_* */
+#define SUNXI_MMC_IDMA_DES0_DIC		(0x1 << 1)  /* no irq on completion */
+#define SUNXI_MMC_IDMA_DES0_LD		(0x1 << 2)  /* last descriptor */
+#define SUNXI_MMC_IDMA_DES0_FD		(0x1 << 3)  /* first descriptor */
+#define SUNXI_MMC_IDMA_DES0_CH		(0x1 << 4)  /* chained, not ring */
+#define SUNXI_MMC_IDMA_DES0_ER		(0x1 << 5)  /* end of ring */
+#define SUNXI_MMC_IDMA_DES0_CES		(0x1 << 30) /* card error summary */
+#define SUNXI_MMC_IDMA_DES0_OWN		(0x1 << 31) /* 1: owned by the IDMA */
+
+/* Bits of the IDMA status register (0x88), Linux SDXC_IDMAC_* */
+#define SUNXI_MMC_IDST_TX		(0x1 << 0)
+#define SUNXI_MMC_IDST_RX		(0x1 << 1)
+#define SUNXI_MMC_IDST_FATAL_BUS_ERROR	(0x1 << 2)
+#define SUNXI_MMC_IDST_DES_INVALID	(0x1 << 4)
+#define SUNXI_MMC_IDST_CARD_ERROR	(0x1 << 5)
+#define SUNXI_MMC_IDST_ABNORMAL_INT_SUM	(0x1 << 9)
+#define SUNXI_MMC_IDST_ERROR		\
+	(SUNXI_MMC_IDST_FATAL_BUS_ERROR |	\
+	 SUNXI_MMC_IDST_DES_INVALID |		\
+	 SUNXI_MMC_IDST_CARD_ERROR |		\
+	 SUNXI_MMC_IDST_ABNORMAL_INT_SUM)
+
 #define SUNXI_MMC_COMMON_CLK_GATE		(1 << 16)
 #define SUNXI_MMC_COMMON_RESET			(1 << 18)
 

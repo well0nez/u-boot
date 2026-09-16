@@ -13,6 +13,7 @@
  * proper DM_MMC implementation at the end.
  */
 
+#include <cpu_func.h>
 #include <dm.h>
 #include <errno.h>
 #include <log.h>
@@ -20,6 +21,7 @@
 #include <mmc.h>
 #include <clk.h>
 #include <reset.h>
+#include <asm/cache.h>
 #include <asm/gpio.h>
 #include <asm/io.h>
 #include <asm/arch/clock.h>
@@ -28,6 +30,7 @@
 #include <asm/arch/mmc.h>
 #endif
 #include <linux/delay.h>
+#include <linux/kernel.h>
 #include <sunxi_gpio.h>
 
 #include "sunxi_mmc.h"
@@ -333,6 +336,259 @@ static int mmc_trans_data_by_cpu(struct sunxi_mmc_priv *priv, struct mmc *mmc,
 	return 0;
 }
 
+#if CONFIG_IS_ENABLED(MMC_SUNXI_IDMA)
+
+/*
+ * Internal DMA (IDMAC).  The controller walks a chain of 16 byte descriptors
+ * in main memory and moves the data itself, which takes the CPU out of the
+ * per-word FIFO loop of mmc_trans_data_by_cpu().
+ *
+ * Everything below follows two sources that agree on this hardware:
+ *   - Linux sunxi-mmc (sunxi_mmc_init_idma_des(), sunxi_mmc_start_dma()),
+ *     the driver that runs this eMMC at HS400 on the same board;
+ *   - the vendor U-Boot 2018.05 of the HY310 (hy310-u-boot.fex, sha256
+ *     b8f40b86fe726145afbb50c067a3fda6b1ee7898340d48af5c5baf6d647f3a88,
+ *     load address 0x4a000000), function sunxi_mmc_do_send_cmd_common at
+ *     0x4a01db68, whose descriptor loop is at 0x4a01dfd4 and whose
+ *     start-up sequence runs from 0x4a01e23e to 0x4a01e346.
+ * Where they differ, the comment says so.
+ */
+
+/*
+ * Bytes per descriptor.  The vendor U-Boot splits every transfer into
+ * 4096 byte chunks (0x4a01e26a is bytecnt >> 12, 0x4a01e266 the
+ * remainder), which is
+ * below the 8192 byte limit that Linux allows for this controller
+ * (sun50i_h713_emmc_cfg, .idma_des_size_bits = 13).  Stay with the vendor.
+ */
+#define SUNXI_MMC_IDMA_MAX_LEN		4096
+
+/*
+ * Length of the descriptor chain.  256 descriptors cover a 1 MiB transfer
+ * and cost 4 KiB of .bss; the vendor keeps a 256 KiB chain
+ * (memalign(64, 0x40000) at 0x4a01e5fe), which we do not need because
+ * b_max caps a single command at the size of our chain.
+ */
+#define SUNXI_MMC_IDMA_DESCS		256
+#define SUNXI_MMC_IDMA_MAX_BYTES	\
+	((unsigned int)SUNXI_MMC_IDMA_MAX_LEN * SUNXI_MMC_IDMA_DESCS)
+#define SUNXI_MMC_IDMA_MAX_BLOCKS	(SUNXI_MMC_IDMA_MAX_BYTES / 512)
+
+/*
+ * Descriptor and buffer addresses are stored as word addresses, i.e. shifted
+ * right by two.  Sources: Linux sun50i_h713_emmc_cfg, .idma_des_shift = 2;
+ * vendor U-Boot at 0x4a01e02c, 0x4a01e064 and 0x4a01e31e, which shifts the
+ * buffer
+ * and the next-descriptor pointer for every SoC revision above 0x000502ff
+ * (the H713 is one of them).
+ */
+#define SUNXI_MMC_IDMA_DES_SHIFT	2
+#define SUNXI_MMC_IDMA_MAX_ADDR		\
+	(0x100000000ULL << SUNXI_MMC_IDMA_DES_SHIFT)
+
+/*
+ * U-Boot runs one MMC transfer at a time, so a single chain serves every
+ * controller.  It has to own whole cache lines, hence the alignment.
+ */
+static struct sunxi_idma_desc
+sunxi_mmc_idma_chain[SUNXI_MMC_IDMA_DESCS] __aligned(ARCH_DMA_MINALIGN);
+
+static uintptr_t sunxi_mmc_data_buf(struct mmc_data *data)
+{
+	if (data->flags & MMC_DATA_READ)
+		return (uintptr_t)data->dest;
+
+	return (uintptr_t)data->src;
+}
+
+static u32 sunxi_mmc_dma_addr(uintptr_t addr)
+{
+	return (u32)((u64)addr >> SUNXI_MMC_IDMA_DES_SHIFT);
+}
+
+static bool sunxi_mmc_dma_capable(struct mmc_data *data, unsigned int bytecnt)
+{
+	uintptr_t buf = sunxi_mmc_data_buf(data);
+
+	/*
+	 * The vendor U-Boot takes the PIO path for 64 bytes and less
+	 * (0x4a01e23e compares against 0x40, 0x4a01e244 branches to the PIO
+	 * path), the IDMA above that, so every
+	 * block sized transfer is a DMA transfer.
+	 */
+	if (bytecnt <= 64 || bytecnt > SUNXI_MMC_IDMA_MAX_BYTES)
+		return false;
+
+	/*
+	 * Cache maintenance works on whole cache lines.  A buffer that does
+	 * not start and end on a line boundary shares its first or last line
+	 * with someone else's data, and flushing or invalidating would take
+	 * that data with it - such a transfer stays on the PIO path.
+	 */
+	if ((buf | bytecnt) & (ARCH_DMA_MINALIGN - 1))
+		return false;
+
+	/* The descriptor holds a word address, so 34 bits of range. */
+	if ((u64)buf + bytecnt > SUNXI_MMC_IDMA_MAX_ADDR)
+		return false;
+
+	return true;
+}
+
+static int mmc_start_dma(struct sunxi_mmc_priv *priv, struct mmc_data *data,
+			 unsigned int bytecnt)
+{
+	struct sunxi_idma_desc *chain = sunxi_mmc_idma_chain;
+	uintptr_t buf = sunxi_mmc_data_buf(data);
+	unsigned int count = DIV_ROUND_UP(bytecnt, SUNXI_MMC_IDMA_MAX_LEN);
+	unsigned int last = bytecnt - (count - 1) * SUNXI_MMC_IDMA_MAX_LEN;
+	unsigned int i, timeout = 1000;
+	u32 val;
+
+	for (i = 0; i < count; i++) {
+		u32 config = SUNXI_MMC_IDMA_DES0_CH |
+			     SUNXI_MMC_IDMA_DES0_DIC |
+			     SUNXI_MMC_IDMA_DES0_OWN;
+
+		if (i == 0)
+			config |= SUNXI_MMC_IDMA_DES0_FD;
+		if (i == count - 1)
+			config = (config & ~SUNXI_MMC_IDMA_DES0_DIC) |
+				 SUNXI_MMC_IDMA_DES0_LD |
+				 SUNXI_MMC_IDMA_DES0_ER;
+
+		chain[i].config = cpu_to_le32(config);
+		chain[i].buf_size = cpu_to_le32(i == count - 1 ? last :
+						SUNXI_MMC_IDMA_MAX_LEN);
+		chain[i].buf_addr = cpu_to_le32(sunxi_mmc_dma_addr(
+				buf + (uintptr_t)i * SUNXI_MMC_IDMA_MAX_LEN));
+		chain[i].next_desc = (i == count - 1) ? 0 :
+			cpu_to_le32(sunxi_mmc_dma_addr(
+					(uintptr_t)&chain[i + 1]));
+	}
+
+	/*
+	 * The engine reads the descriptors and, for a write, the payload out
+	 * of main memory, so both have to be out of the caches first.  For a
+	 * read the flush evicts dirty lines that would otherwise land on top
+	 * of what the engine wrote.  sunxi_mmc_dma_capable() has already
+	 * established that the payload owns whole cache lines.
+	 */
+	flush_dcache_range(buf, buf + bytecnt);
+	flush_dcache_range((uintptr_t)chain,
+			   (uintptr_t)chain +
+			   roundup(count * sizeof(*chain), ARCH_DMA_MINALIGN));
+
+	/* Take the data path off the AHB FIFO and hand it to the IDMA. */
+	clrbits_le32(&priv->reg->gctrl, SUNXI_MMC_GCTRL_ACCESS_BY_AHB);
+	setbits_le32(&priv->reg->gctrl, SUNXI_MMC_GCTRL_DMA_RESET |
+					SUNXI_MMC_GCTRL_DMA_ENABLE);
+
+	/* Vendor 0x4a01e2bc, polled at 0x4a01e2c2; Linux has
+	 * sunxi_mmc_reset_dmactl().
+	 */
+	writel(SUNXI_MMC_IDMAC_RESET, &priv->reg->dmac);
+	while (readl(&priv->reg->dmac) & SUNXI_MMC_IDMAC_RESET) {
+		if (!timeout--) {
+			debug("mmc %u: IDMA reset timeout\n", priv->mmc_no);
+			return -ETIMEDOUT;
+		}
+		udelay(1);
+	}
+
+	/* Vendor 0x4a01e2d6 writes 0x82, Linux writes the same two bits. */
+	writel(SUNXI_MMC_IDMAC_ENABLE | SUNXI_MMC_IDMAC_FIXBURST,
+	       &priv->reg->dmac);
+
+	/*
+	 * We poll the raw interrupt status, so the IDMA interrupt is never
+	 * taken; the vendor arms it all the same (0x4a01e2da to 0x4a01e2fa) and
+	 * so do we,
+	 * because the status bit it gates is what the engine sets on
+	 * completion.
+	 */
+	val = readl(&priv->reg->idie) &
+	      ~(SUNXI_MMC_IDIE_TXIRQ | SUNXI_MMC_IDIE_RXIRQ);
+	val |= (data->flags & MMC_DATA_WRITE) ? SUNXI_MMC_IDIE_TXIRQ :
+						SUNXI_MMC_IDIE_RXIRQ;
+	writel(val, &priv->reg->idie);
+
+	/* Vendor 0x4a01e31e and 0x4a01e326; Linux in init_host(). */
+	writel(sunxi_mmc_dma_addr((uintptr_t)chain), &priv->reg->dlba);
+
+	return 0;
+}
+
+static int mmc_finish_dma(struct sunxi_mmc_priv *priv, struct mmc_data *data,
+			  unsigned int bytecnt)
+{
+	uintptr_t buf = sunxi_mmc_data_buf(data);
+	u32 idst = readl(&priv->reg->idst);
+
+	/* Vendor 0x4a01dc10: status is write-one-to-clear, then stop. */
+	writel(idst, &priv->reg->idst);
+	writel(0, &priv->reg->idie);
+	writel(0, &priv->reg->dmac);
+	clrbits_le32(&priv->reg->gctrl, SUNXI_MMC_GCTRL_DMA_ENABLE);
+
+	/*
+	 * Vendor 0x4a01df28 invalidates the destination after a read, so the
+	 * CPU sees what the engine put there instead of a stale line.
+	 */
+	if (data->flags & MMC_DATA_READ)
+		invalidate_dcache_range(buf, buf + bytecnt);
+
+	if (idst & SUNXI_MMC_IDST_ERROR) {
+		debug("mmc %u: IDMA error, idst %08x\n", priv->mmc_no, idst);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/*
+ * The fixed 120 ms of the PIO path only ever had to cover the tail of a
+ * transfer the CPU had already moved.  With the IDMA the whole transfer
+ * happens inside this wait, so use the same budget the PIO loop gives
+ * itself: one millisecond per 64 bytes, at least two seconds.  An error
+ * still leaves mmc_rint_wait() immediately, this only bounds a silent hang.
+ */
+static uint sunxi_mmc_dma_timeout(unsigned int bytecnt)
+{
+	uint timeout_msecs = bytecnt >> 6;
+
+	return timeout_msecs < 2000 ? 2000 : timeout_msecs;
+}
+
+#else /* !MMC_SUNXI_IDMA */
+
+/* Without the IDMA nothing caps a single command but the MMC core does. */
+#define SUNXI_MMC_IDMA_MAX_BLOCKS	CONFIG_SYS_MMC_MAX_BLK_COUNT
+
+static bool sunxi_mmc_dma_capable(struct mmc_data *data, unsigned int bytecnt)
+{
+	return false;
+}
+
+static int mmc_start_dma(struct sunxi_mmc_priv *priv, struct mmc_data *data,
+			 unsigned int bytecnt)
+{
+	return -ENOSYS;
+}
+
+static int mmc_finish_dma(struct sunxi_mmc_priv *priv, struct mmc_data *data,
+			  unsigned int bytecnt)
+{
+	return 0;
+}
+
+static uint sunxi_mmc_dma_timeout(unsigned int bytecnt)
+{
+	return 120;
+}
+
+#endif /* MMC_SUNXI_IDMA */
+
 static int mmc_rint_wait(struct sunxi_mmc_priv *priv, struct mmc *mmc,
 			 uint timeout_msecs, uint done_bit, const char *what)
 {
@@ -361,6 +617,7 @@ static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
 	int error = 0;
 	unsigned int status = 0;
 	unsigned int bytecnt = 0;
+	bool use_dma = false;
 
 	if (priv->fatal_err)
 		return -1;
@@ -410,13 +667,34 @@ static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
 
 		bytecnt = data->blocksize * data->blocks;
 		debug("trans data %d bytes\n", bytecnt);
-		writel(cmdval | cmd->cmdidx, &priv->reg->cmd);
-		ret = mmc_trans_data_by_cpu(priv, mmc, data);
-		if (ret) {
-			error = readl(&priv->reg->rint) &
-				SUNXI_MMC_RINT_INTERRUPT_ERROR_BIT;
-			error = -ETIMEDOUT;
-			goto out;
+		use_dma = sunxi_mmc_dma_capable(data, bytecnt);
+		if (use_dma) {
+			/*
+			 * The descriptor chain and the DMA registers have to
+			 * stand before the command starts the transfer, as
+			 * they do in the vendor U-Boot (0x4a01e24c to
+			 * 0x4a01e346, the command write is the last one).
+			 */
+			ret = mmc_start_dma(priv, data, bytecnt);
+			if (ret) {
+				/*
+				 * Leave use_dma set: the engine is half
+				 * programmed and mmc_finish_dma() below is
+				 * what puts it back.
+				 */
+				error = ret;
+				goto out;
+			}
+			writel(cmdval | cmd->cmdidx, &priv->reg->cmd);
+		} else {
+			writel(cmdval | cmd->cmdidx, &priv->reg->cmd);
+			ret = mmc_trans_data_by_cpu(priv, mmc, data);
+			if (ret) {
+				error = readl(&priv->reg->rint) &
+					SUNXI_MMC_RINT_INTERRUPT_ERROR_BIT;
+				error = -ETIMEDOUT;
+				goto out;
+			}
 		}
 	}
 
@@ -426,7 +704,7 @@ static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
 		goto out;
 
 	if (data) {
-		timeout_msecs = 120;
+		timeout_msecs = use_dma ? sunxi_mmc_dma_timeout(bytecnt) : 120;
 		debug("cacl timeout %x msec\n", timeout_msecs);
 		error = mmc_rint_wait(priv, mmc, timeout_msecs,
 				      data->blocks > 1 ?
@@ -464,6 +742,13 @@ static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
 		debug("mmc resp 0x%08x\n", cmd->response[0]);
 	}
 out:
+	if (use_dma) {
+		int dma_error = mmc_finish_dma(priv, data, bytecnt);
+
+		if (!error)
+			error = dma_error;
+	}
+
 	if (error < 0) {
 		writel(SUNXI_MMC_GCTRL_RESET, &priv->reg->gctrl);
 		mmc_update_clk(priv);
@@ -709,7 +994,13 @@ static int sunxi_mmc_probe(struct udevice *dev)
 
 	cfg->voltages = MMC_VDD_32_33 | MMC_VDD_33_34;
 	cfg->host_caps = MMC_MODE_HS_52MHz | MMC_MODE_HS;
-	cfg->b_max = CONFIG_SYS_MMC_MAX_BLK_COUNT;
+	/*
+	 * One command must fit into one descriptor chain, so the chain is
+	 * what limits a transfer once the IDMA is in use. Without it this is
+	 * CONFIG_SYS_MMC_MAX_BLK_COUNT as before.
+	 */
+	cfg->b_max = min_t(unsigned int, CONFIG_SYS_MMC_MAX_BLK_COUNT,
+			   SUNXI_MMC_IDMA_MAX_BLOCKS);
 
 	cfg->f_min = 400000;
 	cfg->f_max = 52000000;

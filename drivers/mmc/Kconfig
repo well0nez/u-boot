@@ -810,6 +810,22 @@ config MMC_SUNXI
 	  This selects support for the SD/MMC Host Controller on
 	  Allwinner sunxi SoCs.
 
+config MMC_SUNXI_IDMA
+	bool "Use the internal DMA of the Allwinner sunxi MMC controller"
+	depends on MMC_SUNXI && SUN50I_GEN_H6
+	default y if MACH_SUN50I_H713
+	help
+	  Move the payload of an MMC data transfer with the controller's
+	  internal DMA (IDMAC) instead of feeding its FIFO word by word from
+	  the CPU. Transfers of more than 64 bytes into a cache line aligned
+	  buffer take the DMA path, everything else keeps the PIO path.
+
+	  On the H713 the register sequence is the one the vendor U-Boot and
+	  the Linux driver both use on this SoC. Other members of the H6
+	  generation can turn it on, but have not been measured.
+
+	  Say N to keep every transfer on the PIO path.
+
 config MMC_SUNXI_HAS_NEW_MODE
 	bool
 	depends on MMC_SUNXI
