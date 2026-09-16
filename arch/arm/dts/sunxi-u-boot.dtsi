@@ -44,6 +44,25 @@
 		fit {
 			description = "Configuration to load U-Boot and firmware";
 			#address-cells = <1>;
+			/*
+			 * Keep the payloads outside the FIT structure, on block
+			 * boundaries.  The SPL runs with the MMU off, so every
+			 * load and store goes to Device-nGnRnE memory.  With the
+			 * payloads embedded, spl_simple_fit_read() has to pull
+			 * the whole FIT into a scratch buffer and load_simple_fit()
+			 * then moves every image out of it again; lib/string.c
+			 * memcpy() only copies words when source and destination
+			 * share 8-byte alignment, which an embedded "data"
+			 * property (4-byte aligned inside the FDT) does not, so
+			 * the move degrades to one uncached byte at a time.  On
+			 * the H713 that is 1.4 s for a 940 KiB FIT.
+			 * With external data each image is read straight to its
+			 * load address; the 512-byte alignment makes the
+			 * source and destination of the trailing memmove()
+			 * identical, so the move is skipped entirely.
+			 */
+			fit,external-offset = <0>;
+			fit,align = <0x200>;
 			fit,fdt-list = "of-list";
 
 			images {
