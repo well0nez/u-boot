@@ -826,6 +826,19 @@ config MMC_SUNXI_IDMA
 
 	  Say N to keep every transfer on the PIO path.
 
+config SPL_MMC_SUNXI_IDMA
+	bool "Use the internal DMA of the sunxi MMC controller in SPL"
+	depends on SPL_MMC && MMC_SUNXI && SUN50I_GEN_H6
+	default y if MACH_SUN50I_H713
+	help
+	  Use the same internal DMA in the SPL, where it matters most: the SPL
+	  runs with the MMU and the data cache off, so every word the PIO path
+	  pulls out of the FIFO and every store into the load buffer is a
+	  Device access. On the H713 the SPL reads about 940 KB of FIT that
+	  way, which is most of its boot time; the engine does it at bus speed.
+
+	  Say N to keep every SPL transfer on the PIO path.
+
 config MMC_SUNXI_HAS_NEW_MODE
 	bool
 	depends on MMC_SUNXI
