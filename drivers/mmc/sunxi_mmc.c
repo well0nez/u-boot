@@ -112,6 +112,15 @@ static int mmc_set_mod_clk(struct sunxi_mmc_priv *priv, unsigned int hz)
 			if (priv->mmc_no == 2)
 				pll_hz *= 2;
 		}
+		/*
+		 * The H713 keeps PLL_PERIPH0(2x) at mux 1 for MMC0/1, but its
+		 * MMC2 (the eMMC) has PERIPH0_800M there, with the hidden
+		 * divider of 2: 400 MHz effective, not the 600 MHz assumed
+		 * above. Measured 16.09.2026 on the HY310: asked for 52 MHz,
+		 * the register held M = 12 and the eMMC ran at 33 MHz.
+		 */
+		if (IS_ENABLED(CONFIG_MACH_SUN50I_H713) && priv->mmc_no == 2)
+			pll_hz = pll_hz * 2 / 3;
 	}
 
 	div = pll_hz / hz;
