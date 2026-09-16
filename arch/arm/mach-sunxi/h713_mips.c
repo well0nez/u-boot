@@ -234,8 +234,23 @@ struct h713_panel_cfg {
 	u32 ssc_en;		/* DT 1 -> INI 0          */
 	u32 pll_n_plus_1;	/* display PLL 0x058c0014[15:8] + 1 */
 	/*
-	 * htotal and vtotal go into 0x0525c000 and 0x0524c010 as they stand,
-	 * and those registers hold total MINUS ONE.
+	 * The raster totals in panel_config.ini convention, i.e. the raw
+	 * HTotal/VTotal the ini states. Both rows of the table below are
+	 * written that way; the two consumers apply their own convention:
+	 *
+	 *  - the mixer and DE records, 0x0525c000 and 0x0524c010, hold total
+	 *    MINUS ONE, so the patch table subtracts one there. A live HY310
+	 *    reads 0x045f084f = 2127/1119 for an ini of 2128/1120, and the
+	 *    vendor's own de[0] record carries 04640897 = 2199x1124 for the
+	 *    standard 1080p60 raster of 2200x1125.
+	 *  - the TCON, 0x05880020, takes the raw totals: the vendor's own
+	 *    timing record for the 1280x720 panel writes 02f80550 for an ini
+	 *    of 1360/760.
+	 *
+	 * Keeping one convention in the rows is what the board B repair needed:
+	 * its row stated the raw 1360/760 while the HY310's stated the already
+	 * decremented 2127/1119, so its mixer and DE ran 1361x761 against a
+	 * TCON at 1360x760 (A10 1.3).
 	 */
 	u32 htotal, vtotal, hsync, vsync, hbp, vbp, width;
 	/*
@@ -286,6 +301,7 @@ static const struct h713_panel_cfg h713_panel_cfg_board_b = {
 	 * That sweep is also what established K = 14 in the first place.
 	 */
 	.pll_n_plus_1 = 36,
+	/* ini convention: HTotal 1360, VTotal 760; the DE pair gets 1359/759. */
 	.htotal = 1360, .vtotal = 760, .hsync = 20, .vsync = 2,
 	.hbp = 40, .vbp = 20, .width = 1280, .height = 720,
 	/* All three chosen so this board's registers do not move. */
@@ -332,7 +348,14 @@ static const struct h713_panel_cfg h713_panel_cfg_hy310 = {
 	.de_current = 47, .odd_current = 7, .even_current = 7,
 	.ssc_en = 1,
 	.pll_n_plus_1 = 41,
-	.htotal = 2127, .vtotal = 1119, .hsync = 44, .vsync = 5,
+	/*
+	 * ini convention, as the row above: display_cfg.xml states htotal 2128
+	 * and vtotal 1120, and the patch table's minus-one puts the 2127/1119
+	 * this board has always run into 0x0525c000 and 0x0524c010. The row
+	 * used to carry the decremented pair, which is the convention slip
+	 * board B's row fell over.
+	 */
+	.htotal = 2128, .vtotal = 1120, .hsync = 44, .vsync = 5,
 	.hbp = 88, .vbp = 20, .width = 1920, .height = 1080,
 	.lvds_bitsel = 1, .layer_x = 55,
 	.ssc_mask = 0xffffffff, .ssc_reg = 0xc8d0362f,
@@ -5504,9 +5527,16 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		{ 0x0588000c, 12, 0x3,    c->dual_port },
 		/* AFBD fetch: mirror mode */
 		{ 0x05600140,  2, 0x3,    c->mirror_mode },
-		/* mixer geometry and blanking */
-		{ 0x0525c000, 16, 0xffff, c->vtotal },
-		{ 0x0525c000,  0, 0xffff, c->htotal },
+		/*
+		 * Mixer geometry and blanking. 0x0525c000 holds total MINUS
+		 * ONE -- the conversion lives here, in the one place that
+		 * knows the register, and not in the panel rows, which state
+		 * the ini's raw totals (see struct h713_panel_cfg). The HY310
+		 * keeps the 2127/1119 it has always written; board B stops
+		 * driving a 1361x761 mixer raster into a 1360x760 TCON.
+		 */
+		{ 0x0525c000, 16, 0xffff, c->vtotal - 1 },
+		{ 0x0525c000,  0, 0xffff, c->htotal - 1 },
 		{ 0x0525c004,  8, 0xff,   c->hsync },
 		{ 0x0525c004,  0, 0xff,   c->vsync },
 		{ 0x0525c01c,  0, 0xffff, c->hsync + c->hbp },
@@ -5521,9 +5551,11 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		 * value as the mixer's. Omitting it left the DE composing
 		 * 1440x741 beneath a mixer at 1360x760 -- visible in a live
 		 * dump as de +0x10 holding the unpatched 0x02e4059f.
+		 *
+		 * Same minus-one convention as 0x0525c000 above.
 		 */
-		{ 0x0524c010, 16, 0xffff, c->vtotal },
-		{ 0x0524c010,  0, 0xffff, c->htotal },
+		{ 0x0524c010, 16, 0xffff, c->vtotal - 1 },
+		{ 0x0524c010,  0, 0xffff, c->htotal - 1 },
 		/* display engine */
 		{ 0x0524c004, 16, 0xffff, c->width },
 		{ 0x0524c004,  0, 0xffff, c->vsync + c->vbp },
@@ -8913,7 +8945,8 @@ static void h713_disp_hbp_sweep(void)
 		printf("H713 hbp: step %u, back porch %u (0x05880028=%08x), "
 		       "front porch becomes %d; observe the band\n",
 		       i + 1, hbp_val, readl(0x05880028),
-		       (int)h713_disp_panel->htotal + 1 -
+		       /* htotal is the raw total now, so no +1 here. */
+		       (int)h713_disp_panel->htotal -
 		       (int)h713_disp_panel->width -
 		       (int)(saved_porch >> 16) - (int)hbp_val);
 		mdelay(H713_DISP_CHROMA_PHASE_MS);
