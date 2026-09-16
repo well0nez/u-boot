@@ -4998,7 +4998,8 @@ U_BOOT_CMD(h713_i2c, 4, 0, do_h713_i2c,
 /*
  * One-shot replay of stock U-Boot's fastlogo display bring-up.
  *
- * LogoRegData.bin is indexed: 13 descriptors of 0x18 bytes from offset 0x10,
+ * LogoRegData.bin is indexed: descriptors of 0x18 bytes from offset 0x10 (how
+ * many is in the header -- 15 on the HY310's file, 13 on the HY300 Pro's),
  * each starting with a project ID that matches the ProjectID_*.TSE names. Two
  * of its words select which tables that project uses --
  *
@@ -5011,31 +5012,86 @@ U_BOOT_CMD(h713_i2c, 4, 0, do_h713_i2c,
  *
  * Stock's order is: prologue, timing, LVDS FIFO reset, mixer write, DE table,
  * then clocks/INCAP/LVDS, the coprocessor release, and the LVDS finalise.
+ *
+ * Where those tables *are* comes from the file, never from constants. Behind
+ * the descriptor table the container is a chain of blocks:
+ *
+ *   +0x00 u32 index   +0x04 u32 payload length   then the payload
+ *
+ * The index counts up inside a class and restarts at zero when the next class
+ * begins: head block, prologue 1..3, timing 0..10, DE 0..7. That is exactly
+ * the numbering the descriptor words use -- and it is why the prologue
+ * variant is 1-based: index 0 of its class is the file's own head block.
+ *
+ * This used to be three tables of byte offsets measured on the HY310's
+ * 15652-byte file, which has 15 descriptors. The HY300 Pro's firmware
+ * generation carries 13, so every block sits 0x30 lower, and its timing and
+ * DE tables are sized differently again. On that file the fixed DE range for
+ * project 0x34 (0x361c..0x39a4) began in the middle of DE variant 7 and ran
+ * 368 bytes past the end of the file, into whatever DRAM held before the blob
+ * was loaded -- an arbitrary write into the 0x02000000/0x04000000 windows,
+ * which is a silent bus hang. Deriving the boundaries reproduces all 22 of
+ * the old HY310 constants exactly; see umbau/work/E4.
  */
 struct h713_disp_block { u32 start, end; };
 
-static const struct h713_disp_block h713_disp_prologue[] = {
-	{ 0x01ac, 0x0484 }, { 0x0484, 0x075c }, { 0x075c, 0x0a34 },
-};
-
-static const struct h713_disp_block h713_disp_timing[] = {
-	{ 0x0a34, 0x0c0c }, { 0x0c0c, 0x0de4 }, { 0x0de4, 0x100c },
-	{ 0x100c, 0x11e4 }, { 0x11e4, 0x141c }, { 0x141c, 0x1654 },
-	{ 0x1654, 0x18dc }, { 0x18dc, 0x1a04 }, { 0x1a04, 0x1c3c },
-	{ 0x1c3c, 0x1ec4 }, { 0x1ec4, 0x214c },
-};
-
-static const struct h713_disp_block h713_disp_de[] = {
-	{ 0x214c, 0x24c4 }, { 0x24c4, 0x283c }, { 0x283c, 0x2bb4 },
-	{ 0x2bb4, 0x2f2c }, { 0x2f2c, 0x32a4 }, { 0x32a4, 0x361c },
-	{ 0x361c, 0x39a4 }, { 0x39a4, 0x3d24 },
-};
-
 #define H713_DISP_DESC_OFF	0x10
 #define H713_DISP_DESC_SIZE	0x18
-#define H713_DISP_HDR_TABLE_LEN	8
+#define H713_DISP_HDR_TABLE_LEN	8	/* u16: descriptor table bytes */
+#define H713_DISP_HDR_HEAD_LEN	0x0a	/* u16: head block payload bytes */
+#define H713_DISP_HDR_REST	0x0c	/* u32: block bytes after that */
+#define H713_DISP_BLOCK_HDR	8
 
-struct h713_disp_sel { u32 project, prologue, timing, de; };
+struct h713_disp_sel {
+	u32 project, prologue, timing, de;
+	struct h713_disp_block prologue_range, timing_range, de_range;
+};
+
+/* The container's length, from the four words of its own header. */
+static ulong h713_disp_size(ulong blob)
+{
+	return H713_DISP_DESC_OFF + readw(blob + H713_DISP_HDR_TABLE_LEN) +
+	       readw(blob + H713_DISP_HDR_HEAD_LEN) +
+	       readl(blob + H713_DISP_HDR_REST);
+}
+
+/*
+ * Resolve one group: walk the block chain, count a class boundary wherever
+ * the block index stops rising, and hand back the payload of the block whose
+ * index is the wanted variant. `end` is the payload end; the old constants
+ * carried the next block's 8-byte header as well, which the walker never
+ * reads (it needs off + 16 <= end and every payload is a multiple of 16).
+ */
+static int h713_disp_group(ulong blob, uint want_class, uint index,
+			   struct h713_disp_block *out)
+{
+	ulong size = h713_disp_size(blob);
+	ulong off = H713_DISP_DESC_OFF + readw(blob + H713_DISP_HDR_TABLE_LEN);
+	bool first = true;
+	uint cls = 0;
+	u32 prev = 0;
+
+	while (off + H713_DISP_BLOCK_HDR <= size) {
+		u32 idx = readl(blob + off);
+		u32 len = readl(blob + off + 4);
+
+		if (!len || off + H713_DISP_BLOCK_HDR + len > size)
+			break;
+		if (!first && idx <= prev)
+			cls++;
+		first = false;
+		prev = idx;
+
+		if (cls == want_class && idx == index) {
+			out->start = off + H713_DISP_BLOCK_HDR;
+			out->end = out->start + len;
+			return 0;
+		}
+		off += H713_DISP_BLOCK_HDR + len;
+	}
+
+	return -ENOENT;
+}
 
 /*
  * Descriptor count is in the header, not fixed: this board's file carries 15
@@ -5074,14 +5130,27 @@ static int h713_disp_lookup(ulong blob, u32 project,
 		sel->de       = w4 & 0xffff;
 
 		if (!sel->prologue ||
-		    sel->prologue > ARRAY_SIZE(h713_disp_prologue) ||
-		    sel->timing >= ARRAY_SIZE(h713_disp_timing) ||
-		    sel->de >= ARRAY_SIZE(h713_disp_de)) {
-			printf("H713 disp: project 0x%02x selects out-of-range "
-			       "tables (%u/%u/%u)\n", id, sel->prologue,
-			       sel->timing, sel->de);
+		    h713_disp_group(blob, 0, sel->prologue,
+				    &sel->prologue_range) ||
+		    h713_disp_group(blob, 1, sel->timing, &sel->timing_range) ||
+		    h713_disp_group(blob, 2, sel->de, &sel->de_range)) {
+			printf("H713 disp: project 0x%02x selects tables this "
+			       "file does not carry (%u/%u/%u)\n", id,
+			       sel->prologue, sel->timing, sel->de);
 			return -EINVAL;
 		}
+
+		/*
+		 * Say where they landed. A boot log that stops inside the
+		 * replay then names the group it was walking, without a
+		 * rebuild and without the owner's copy of the file.
+		 */
+		printf("H713 disp: groups from the file (%lu bytes): prologue "
+		       "0x%04x..0x%04x, timing 0x%04x..0x%04x, de "
+		       "0x%04x..0x%04x\n", h713_disp_size(blob),
+		       sel->prologue_range.start, sel->prologue_range.end,
+		       sel->timing_range.start, sel->timing_range.end,
+		       sel->de_range.start, sel->de_range.end);
 
 		/*
 		 * The declared project ID is what names the panel, and it is
@@ -5449,9 +5518,7 @@ static int h713_disp_panel_patch(ulong blob, const struct h713_disp_sel *sel)
 		{ 0x0528008c,  0, 0xffff, c->layer_x },
 	};
 	const struct h713_disp_block *ranges[] = {
-		&h713_disp_prologue[sel->prologue - 1],
-		&h713_disp_timing[sel->timing],
-		&h713_disp_de[sel->de],
+		&sel->prologue_range, &sel->timing_range, &sel->de_range,
 	};
 	int patched = 0, guarded = 0;
 	uint i, r;
@@ -5967,20 +6034,20 @@ static int h713_disp_run(ulong blob, u32 project, bool skip_hdcp_wait,
 	if (ret)
 		return ret;
 
-	ret = h713_logo_walk(blob, h713_disp_prologue[sel.prologue - 1].start,
-			     h713_disp_prologue[sel.prologue - 1].end, true);
+	ret = h713_logo_walk(blob, sel.prologue_range.start,
+			     sel.prologue_range.end, true);
 	if (ret)
 		return ret;
-	ret = h713_logo_walk(blob, h713_disp_timing[sel.timing].start,
-			     h713_disp_timing[sel.timing].end, true);
+	ret = h713_logo_walk(blob, sel.timing_range.start,
+			     sel.timing_range.end, true);
 	if (ret)
 		return ret;
 
 	h713_disp_fifo_reset();
 	writel(H713_DISPLAY_MIXER_CTRL_VALUE, H713_DISPLAY_MIXER_CTRL_REG);
 
-	ret = h713_logo_walk(blob, h713_disp_de[sel.de].start,
-			     h713_disp_de[sel.de].end, true);
+	ret = h713_logo_walk(blob, sel.de_range.start, sel.de_range.end,
+			     true);
 	if (ret)
 		return ret;
 
@@ -9828,8 +9895,8 @@ static int h713_disp_reassert_osd(ulong blob, u32 project)
 	/* Stock writes the mixer control ahead of the DE table; keep parity. */
 	writel(H713_DISPLAY_MIXER_CTRL_VALUE, H713_DISPLAY_MIXER_CTRL_REG);
 
-	ret = h713_logo_walk(blob, h713_disp_de[sel.de].start,
-			     h713_disp_de[sel.de].end, true);
+	ret = h713_logo_walk(blob, sel.de_range.start, sel.de_range.end,
+			     true);
 	if (ret)
 		return ret;
 
