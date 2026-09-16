@@ -254,6 +254,16 @@ struct h713_panel_cfg {
 	 */
 	u32 htotal, vtotal, hsync, vsync, hbp, vbp, width;
 	/*
+	 * PanelHsyncPol / PanelVsyncPol of panel_config.ini: 1 on the HY310,
+	 * 0 on the 1280x720 panel. They drive bit 31 of the TCON's 0x0588002c
+	 * and 0x05880030, which the latch below used to hardcode as set for
+	 * every board it wrote. What that bit does is still an open question;
+	 * the only claim made here is stock's own: the vendor timing record of
+	 * a 0/0 panel writes both words with bit 31 clear (00000014 /
+	 * 00010003), and an HY310 (1/1) is left running them set.
+	 */
+	u32 hsync_pol, vsync_pol;
+	/*
 	 * Active height. Not derivable from the fields above -- the register
 	 * table never carries it -- but the OSD surface has to be sized
 	 * somehow, so name it.
@@ -304,6 +314,8 @@ static const struct h713_panel_cfg h713_panel_cfg_board_b = {
 	/* ini convention: HTotal 1360, VTotal 760; the DE pair gets 1359/759. */
 	.htotal = 1360, .vtotal = 760, .hsync = 20, .vsync = 2,
 	.hbp = 40, .vbp = 20, .width = 1280, .height = 720,
+	/* panel_config.ini: PanelHsyncPol 0, PanelVsyncPol 0. */
+	.hsync_pol = 0, .vsync_pol = 0,
 	/* All three chosen so this board's registers do not move. */
 	.lvds_bitsel = 0, .layer_x = 0, .ssc_mask = 0, .ssc_reg = 0,
 	.layer_h_mask = 0,
@@ -357,6 +369,8 @@ static const struct h713_panel_cfg h713_panel_cfg_hy310 = {
 	 */
 	.htotal = 2128, .vtotal = 1120, .hsync = 44, .vsync = 5,
 	.hbp = 88, .vbp = 20, .width = 1920, .height = 1080,
+	/* panel_config.ini: PanelHsyncPol 1, PanelVsyncPol 1. */
+	.hsync_pol = 1, .vsync_pol = 1,
 	.lvds_bitsel = 1, .layer_x = 55,
 	.ssc_mask = 0xffffffff, .ssc_reg = 0xc8d0362f,
 	.layer_h_mask = 0xffff,
@@ -8264,12 +8278,21 @@ static void h713_disp_panel_control_test(void)
 
 /*
  * Restore the panel timing that project 0x33's timing block 6 programmed
- * before the MIPS replaced it with 1080p. Carry the live bit-31 enables into
- * +0x2c/+0x30, then pulse the same +0x0c latch used by the vendor table.
+ * before the MIPS replaced it with 1080p, then pulse the same +0x0c latch used
+ * by the vendor table.
+ *
+ * Every word written below comes from the panel row: the TCON's own convention
+ * is the raw totals (unlike the mixer's minus-one), and bit 31 of +0x2c/+0x30
+ * comes from the ini's PanelHsyncPol/PanelVsyncPol. It used to say it carried
+ * "the live bit-31 enables" and in fact hardcoded them set, on a panel whose
+ * ini asks for 0/0 and whose own vendor timing record writes them clear
+ * (A10 1.2). The low half of +0x30 stays literal because nobody has explained
+ * it: [15:0] = 3 where vsync is 2, so it is not a plain sync width.
  */
 static void h713_disp_latch_panel_timing(void)
 {
-	const bool board_b = (h713_disp_panel == &h713_panel_cfg_board_b);
+	const struct h713_panel_cfg *c = h713_disp_panel;
+	const bool board_b = (c == &h713_panel_cfg_board_b);
 	u32 live_total  = readl(0x05880020);
 	u32 live_active = readl(0x05880024);
 	u32 ctl  = readl(0x0588000c);
@@ -8294,11 +8317,12 @@ static void h713_disp_latch_panel_timing(void)
 	 */
 	if (board_b) {
 		writel((mode & ~0x7) | 0x4, 0x0588001c);
-		writel(0x02f80550, 0x05880020);	/* 1360x760 total */
-		writel(0x02d00500, 0x05880024);	/* 1280x720 active */
-		writel(0x00140028, 0x05880028);
-		writel(0x80000014, 0x0588002c);
-		writel(0x80010003, 0x05880030);
+		/* Raw totals here, not the mixer's total minus one. */
+		writel((c->vtotal << 16) | c->htotal, 0x05880020);
+		writel((c->height << 16) | c->width, 0x05880024);
+		writel((c->vbp << 16) | c->hbp, 0x05880028);
+		writel((c->hsync_pol ? BIT(31) : 0) | c->hsync, 0x0588002c);
+		writel((c->vsync_pol ? BIT(31) : 0) | 0x00010003, 0x05880030);
 	} else {
 		printf("H713 panel: TCON 1c=%08x 20=%08x 24=%08x 28=%08x "
 		       "2c=%08x 30=%08x; mixer %08x (these differ by design)\n",
