@@ -4610,6 +4610,26 @@ struct h713_logo_rec {
 	u32 type;
 };
 
+/*
+ * `setenv h713_trace 1` makes the applying walk name every record on the
+ * console *before* it touches the bus. A write into a block whose clock or
+ * reset is not up hangs silently, and the console is synchronous, so the last
+ * line a stalled log carries is the record that hung -- no rebuild, no
+ * debugger, and a remote owner can produce it. Off by default: it is one line
+ * per record, which is some 90 lines for a full bring-up.
+ *
+ * Every wait the walk can enter is bounded: the delay record is capped at
+ * H713_LOGO_MAX_DELAY_US, the pulse is two stores with no read-back loop, and
+ * the resync step only ever advances `off` towards `end`. There is no
+ * poll-until-ready anywhere in here, so a stall is always the bus, never us.
+ */
+static bool h713_logo_tracing(void)
+{
+	const char *set = env_get("h713_trace");
+
+	return set && *set && *set != '0';
+}
+
 static bool h713_logo_reg_sane(u32 addr)
 {
 	/* CCU, PIO/MIPS control, and the display/capture blocks only. */
@@ -4619,6 +4639,7 @@ static bool h713_logo_reg_sane(u32 addr)
 
 static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 {
+	const bool trace = apply && h713_logo_tracing();
 	ulong off;
 	int written = 0, skipped = 0, delayed = 0, pulsed = 0;
 
@@ -4658,6 +4679,9 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 			off += sizeof(struct h713_logo_rec);
 			u32 us = min_t(u32, r.val, H713_LOGO_MAX_DELAY_US);
 
+			if (trace)
+				printf("  T +0x%04lx  delay %u us\n",
+				       off - sizeof(struct h713_logo_rec), us);
 			if (apply)
 				udelay(us);
 			else
@@ -4689,6 +4713,10 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 				continue;
 			}
 
+			if (trace)
+				printf("  T +0x%04lx  %08x pulse mask %08x\n",
+				       off - sizeof(struct h713_logo_rec),
+				       r.addr, r.mask);
 			cur = readl(reg);
 			writel(cur & ~r.mask, reg);
 			writel(cur | r.mask, reg);
@@ -4711,6 +4739,11 @@ static int h713_logo_walk(ulong base, ulong start, ulong end, bool apply)
 			written++;
 			continue;
 		}
+
+		if (trace)
+			printf("  T +0x%04lx  %08x <- %08x mask %08x w%u\n",
+			       off - sizeof(struct h713_logo_rec), r.addr,
+			       r.val, r.mask, r.type);
 
 		/* Masked read-modify-write at the record's access width. */
 		switch (r.type) {
