@@ -639,9 +639,15 @@ static int mmc_rint_wait(struct sunxi_mmc_priv *priv, struct mmc *mmc,
 	return 0;
 }
 
-static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
-				     struct mmc *mmc, struct mmc_cmd *cmd,
-				     struct mmc_data *data)
+/*
+ * One attempt at one command.  @allow_dma is false for the PIO repeat that
+ * sunxi_mmc_send_cmd_common() makes after an IDMA fault; *@dma_fault comes
+ * back true only when the engine, and not the card, is what went wrong.
+ */
+static int sunxi_mmc_send_cmd_once(struct sunxi_mmc_priv *priv,
+				   struct mmc *mmc, struct mmc_cmd *cmd,
+				   struct mmc_data *data, bool allow_dma,
+				   bool *dma_fault)
 {
 	unsigned int cmdval = SUNXI_MMC_CMD_START;
 	unsigned int timeout_msecs;
@@ -698,7 +704,7 @@ static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
 
 		bytecnt = data->blocksize * data->blocks;
 		debug("trans data %d bytes\n", bytecnt);
-		use_dma = sunxi_mmc_dma_capable(data, bytecnt);
+		use_dma = allow_dma && sunxi_mmc_dma_capable(data, bytecnt);
 		if (use_dma) {
 			/*
 			 * The descriptor chain and the DMA registers have to
@@ -711,8 +717,11 @@ static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
 				/*
 				 * Leave use_dma set: the engine is half
 				 * programmed and mmc_finish_dma() below is
-				 * what puts it back.
+				 * what puts it back.  No command has been
+				 * written yet, so the PIO repeat is a clean
+				 * first attempt.
 				 */
+				*dma_fault = true;
 				error = ret;
 				goto out;
 			}
@@ -742,8 +751,21 @@ static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
 				      SUNXI_MMC_RINT_AUTO_COMMAND_DONE :
 				      SUNXI_MMC_RINT_DATA_OVER,
 				      "data");
-		if (error)
+		if (error) {
+			/*
+			 * The data phase ran out of time and the controller
+			 * reports nothing wrong with the card - then it is the
+			 * engine that did not finish, and the CPU can try.  A
+			 * card error (CRC, timeout) is the card's answer and
+			 * repeating it on the PIO path would only ask twice;
+			 * the tuning sweep of HS200 lives on exactly that
+			 * answer 63 times out of 64.
+			 */
+			if (use_dma && !(readl(&priv->reg->rint) &
+					 SUNXI_MMC_RINT_INTERRUPT_ERROR_BIT))
+				*dma_fault = true;
 			goto out;
+		}
 	}
 
 	if (cmd->resp_type & MMC_RSP_BUSY) {
@@ -776,8 +798,12 @@ out:
 	if (use_dma) {
 		int dma_error = mmc_finish_dma(priv, data, bytecnt);
 
-		if (!error)
-			error = dma_error;
+		/* mmc_finish_dma() only fails on the engine's own error bits. */
+		if (dma_error) {
+			*dma_fault = true;
+			if (!error)
+				error = dma_error;
+		}
 	}
 
 	if (error < 0) {
@@ -789,6 +815,32 @@ out:
 	       &priv->reg->gctrl);
 
 	return error;
+}
+
+static int sunxi_mmc_send_cmd_common(struct sunxi_mmc_priv *priv,
+				     struct mmc *mmc, struct mmc_cmd *cmd,
+				     struct mmc_data *data)
+{
+	bool dma_fault = false;
+	int error;
+
+	error = sunxi_mmc_send_cmd_once(priv, mmc, cmd, data, true, &dma_fault);
+	if (!error || !dma_fault)
+		return error;
+
+	/*
+	 * The IDMA engine, not the card, is what failed, and the path out of
+	 * sunxi_mmc_send_cmd_once() has already reset the controller and the
+	 * engine.  Do the transfer again on the CPU: in U-Boot proper that
+	 * costs a slow command, in the SPL it is the difference between a
+	 * device that boots and a device that needs FEL.  Say so on the UART
+	 * either way - a boot that quietly takes ten times as long is a bug
+	 * report nobody can make sense of.
+	 */
+	printf("mmc %u: IDMA failed (%d), repeating the transfer on the CPU\n",
+	       priv->mmc_no, error);
+
+	return sunxi_mmc_send_cmd_once(priv, mmc, cmd, data, false, &dma_fault);
 }
 
 static void sunxi_mmc_reset(void *regs)
