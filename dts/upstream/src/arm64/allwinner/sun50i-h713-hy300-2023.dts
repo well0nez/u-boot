@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * MagCubic "HY300" with the 2023-06 ADT-3 firmware, reported in issue #8 of
+ * well0nez/allwinner-h713-linux by its owner. Nobody here has held one; its
+ * owner cannot open it, so the silkscreen is unknown.
+ *
+ * Like the HY300 Pro's tree, this is an include of the bench board's rather
+ * than a copy, for the same reason: a board should boot a device tree named
+ * after itself, so that a boot log says which board it is running on. The
+ * DRAM clock and words that distinguish this board (792 MHz, the HY350
+ * family's block) live in configs/hy300_2023_defconfig, not here.
+ *
+ * What is *not* claimed by this file: the panel. It declares project id 0x34,
+ * 1280x720; no node here describes a panel, the display coprocessor drives it
+ * from its own tables, and its firmware is a revision of its own ("ADT-3
+ * 2023-06" in h713_mips.c).
+ *
+ * Nothing about this board has been measured as different from the bench
+ * board's tree, so nothing else is overridden.
+ */
+
+#include "sun50i-h713-hy200-qz713df-a1.dts"
+
+/ {
+	model = "MagCubic HY300 (2023 firmware)";
+	compatible = "magcubic,hy300-2023", "allwinner,sun50i-h713";
+};

@@ -716,6 +716,35 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 			0xc7, 0x3f, 0x1f, 0xad, 0x81, 0xe8, 0x0c, 0x2c,
 		},
 	},
+	{
+		/*
+		 * The MagCubic HY300 of issue #8 (the classic case, 720p, project
+		 * 0x34) on the oldest ADT-3 firmware reported so far: U-Boot and
+		 * ARISC of 2023-06-25. Its display.bin is 272 bytes short of the
+		 * "ADT-3 2024" image and 256 short of the LOSEI X9's; none of the
+		 * other rows' digests match it. Read off the owner's partition
+		 * files by h713-extract (04.11.2026): size, digest, and the wait
+		 * site found by the same search this code runs (file offset
+		 * 0x3cf00). The four firmware addresses stay zero: they come from
+		 * a disassembly of the image or a device run, and this board had
+		 * neither. The readers of these fields refuse while they are
+		 * zero, which is the documented meaning of zero here.
+		 *
+		 * The name is the firmware's date, not a board's: the owner
+		 * cannot open the unit, the silkscreen is unknown.
+		 */
+		.board = "ADT-3 2023-06",
+		.size = 0x131a10,
+		.hdcp_wait_va = 0x4b13cf00,
+		.cpuid_va = 0, .comm_dev_ptr = 0,
+		.elog_ring = 0, .elog_wr = 0,
+		.digest = {
+			0x1e, 0x3e, 0x51, 0x8f, 0xe0, 0xa6, 0xa2, 0x50,
+			0xa0, 0x01, 0x1f, 0x2d, 0xd6, 0x06, 0xcc, 0x14,
+			0x5d, 0x01, 0x50, 0xb5, 0x0f, 0xc8, 0x43, 0xc5,
+			0x87, 0x03, 0x1e, 0x3a, 0x82, 0xaf, 0x0e, 0x34,
+		},
+	},
 };
 
 /* Set by h713_mips_verify() once the image is identified. */
