@@ -745,6 +745,33 @@ static const struct h713_mips_fw_rev h713_mips_fw_revs[] = {
 			0x87, 0x03, 0x1e, 0x3a, 0x82, 0xaf, 0x0e, 0x34,
 		},
 	},
+	{
+		/*
+		 * "ADT-3 2024-09": the display.bin two boards carry, 16 bytes
+		 * short of "ADT-3 2024" and 256 over "ADT-3 2023-06". First seen
+		 * on the LOSEI X9 (issue #3, 25.10.2026, the vendor copy), where
+		 * it got its row in the installer's table but none here; then on
+		 * the MagCubic HY300 with the 2023-12 firmware (issue #11,
+		 * 11.11.2026, h713-extract over the owner's full dump: same
+		 * size, same digest, the wait site found by the same search this
+		 * code runs, file offset 0x3d140). The four firmware addresses
+		 * stay zero, as in the 2023-06 row: no disassembly, no device run.
+		 *
+		 * The name is the firmware's, not a board's: two boards, two
+		 * cases, one image.
+		 */
+		.board = "ADT-3 2024-09",
+		.size = 0x131b10,
+		.hdcp_wait_va = 0x4b13d140,
+		.cpuid_va = 0, .comm_dev_ptr = 0,
+		.elog_ring = 0, .elog_wr = 0,
+		.digest = {
+			0x49, 0xf6, 0x98, 0xaf, 0x43, 0xce, 0x71, 0x4a,
+			0x70, 0xe0, 0x43, 0x90, 0xa9, 0xa8, 0x10, 0x15,
+			0xfa, 0xa5, 0xb2, 0x28, 0xdb, 0xff, 0xc2, 0xd7,
+			0x3c, 0xc3, 0x84, 0x72, 0x2f, 0x0b, 0x30, 0x7b,
+		},
+	},
 };
 
 /* Set by h713_mips_verify() once the image is identified. */
